@@ -1,0 +1,7 @@
+{
+  "name": "GoMaki",
+  "slug": "gomaki",
+  "identifier": "dev.jenggo.gomaki",
+  "version": "0.1.0",
+  "main": "./cmd/gomaki"
+}
