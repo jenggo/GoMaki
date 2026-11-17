@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"os/exec"
@@ -42,7 +43,8 @@ type entry struct {
 	Status     string
 	ToolInput  string
 	ToolOutput string
-	Plan       []acpclient.PlanEntry
+	ToolKind   string
+	Todos      []acpclient.PlanEntry
 	Kind       entryKind
 	Expanded   bool
 }
@@ -99,9 +101,11 @@ type app struct {
 	models []string
 	modes  []string
 
-	sessions []acpclient.SessionInfo
-	families []string
-	plan     []acpclient.PlanEntry
+	sessions  []acpclient.SessionInfo
+	families  []string
+	plan      []acpclient.PlanEntry
+	planPath  string
+	planReady bool
 
 	sessionPick int
 
@@ -306,6 +310,7 @@ func (a *app) apply(e acpclient.Event) {
 		if status == "" {
 			status = toolPending
 		}
+		a.capturePlanPath(e.ToolKind, e.ToolInput)
 		a.transcript = append(a.transcript, entry{
 			Kind:       entryTool,
 			Text:       e.Title,
@@ -313,6 +318,8 @@ func (a *app) apply(e acpclient.Event) {
 			Status:     status,
 			ToolInput:  e.ToolInput,
 			ToolOutput: e.ToolOutput,
+			ToolKind:   e.ToolKind,
+			Todos:      parseTodos(e.ToolInput),
 			Started:    time.Now(),
 		})
 	case acpclient.EventToolCallUpdate:
@@ -365,6 +372,11 @@ func (a *app) promptDone(e acpclient.Event) {
 	} else {
 		a.notice = ""
 		a.notify(appName, "Turn finished.")
+		if a.mode == modePlan && a.planPath != "" {
+			if _, _, ok := a.matchCommand("/opsx:ff"); ok {
+				a.planReady = true
+			}
+		}
 	}
 	a.lastPrompt = ""
 	if e.Err != nil {
@@ -404,12 +416,55 @@ func (a *app) updateToolCall(e acpclient.Event) {
 		}
 		if e.ToolInput != "" {
 			a.transcript[i].ToolInput = e.ToolInput
+			a.transcript[i].Todos = parseTodos(e.ToolInput)
+			a.capturePlanPath(a.transcript[i].ToolKind, e.ToolInput)
 		}
 		if e.ToolOutput != "" {
 			a.transcript[i].ToolOutput = e.ToolOutput
 		}
 		return
 	}
+}
+
+// capturePlanPath remembers the file Maki writes while plan mode is on. Plan
+// mode allows writes only to that file, so an edit call names the plan.
+func (a *app) capturePlanPath(kind, input string) {
+	if a.mode != modePlan || kind != toolKindEdit {
+		return
+	}
+	var in struct {
+		Path     string `json:"path"`
+		FilePath string `json:"file_path"`
+	}
+	if json.Unmarshal([]byte(input), &in) != nil {
+		return
+	}
+	path := in.Path
+	if path == "" {
+		path = in.FilePath
+	}
+	if path != "" {
+		a.planPath = path
+	}
+}
+
+// parseTodos reads a todo tool call's input, which is a JSON object with a
+// "todos" array. Other tool inputs return nil.
+func parseTodos(input string) []acpclient.PlanEntry {
+	var v struct {
+		Todos []struct {
+			Content string `json:"content"`
+			Status  string `json:"status"`
+		} `json:"todos"`
+	}
+	if json.Unmarshal([]byte(input), &v) != nil || len(v.Todos) == 0 {
+		return nil
+	}
+	todos := make([]acpclient.PlanEntry, len(v.Todos))
+	for i, t := range v.Todos {
+		todos[i] = acpclient.PlanEntry{Content: t.Content, Status: t.Status}
+	}
+	return todos
 }
 
 // runningTools returns the transcript indexes of tool calls still running.
@@ -494,6 +549,8 @@ func (a *app) resume(id string) {
 func (a *app) reset() {
 	a.transcript = nil
 	a.plan = nil
+	a.planPath = ""
+	a.planReady = false
 	a.planExpanded = false
 	a.prompt = ""
 	a.busy = false
@@ -620,31 +677,74 @@ func (a *app) send(text string) bool {
 	if text == "" || a.busy || a.client == nil {
 		return false
 	}
-	a.prompt = ""
-	a.err = ""
-	a.notice = ""
-	a.lastPrompt = text
-	a.escAt = time.Time{}
 	att := a.attach
 	display := text
 	if a.attachName != "" {
 		display += "\n\n[" + a.attachName + "]"
 	}
+	return a.sendPrompt(a.expandedPrompt(text), display, att)
+}
+
+// sendPrompt starts a turn with an already-expanded prompt and a short line
+// for the transcript.
+func (a *app) sendPrompt(prompt, display string, att *acpclient.Attachment) bool {
+	a.prompt = ""
+	a.err = ""
+	a.notice = ""
+	a.lastPrompt = display
+	a.escAt = time.Time{}
+	a.planReady = false
 	mark := len(a.transcript)
 	a.transcript = append(a.transcript, entry{Kind: entryUser, Text: display})
 	a.busy = true
 	a.status = "Working…"
-	agentText := a.expandedPrompt(text)
 	if a.sessionID == "" {
-		a.startSessionAndPrompt(agentText, text, att, mark)
+		a.startSessionAndPrompt(prompt, display, att, mark)
 		return true
 	}
-	if err := a.client.Prompt(agentText, att); err != nil {
-		a.failSend(text, mark, err)
+	if err := a.client.Prompt(prompt, att); err != nil {
+		a.failSend(display, mark, err)
 		return false
 	}
 	a.clearAttachment()
 	return true
+}
+
+// sendPlanChange hands the accepted plan to the OpenSpec fast-forward
+// workflow. The mode switch is awaited so the agent may write the artifacts.
+func (a *app) sendPlanChange() {
+	path := a.planPath
+	cmd, _, ok := a.matchCommand("/opsx:ff")
+	if !ok || path == "" || a.busy || a.client == nil {
+		return
+	}
+	prompt := planChangePrompt(cmd, path)
+	a.planPath = ""
+	a.planReady = false
+	prev := a.mode
+	a.mode = "build"
+	a.syncMenu()
+	a.win.Invalidate()
+	go func() {
+		if err := a.client.SetMode("build"); err != nil {
+			a.win.Update(func() {
+				a.mode = prev
+				a.planPath = path
+				a.planReady = true
+				a.err = err.Error()
+				a.syncMenu()
+			})
+			return
+		}
+		a.win.Update(func() { a.sendPrompt(prompt, "/opsx:ff (from plan)", nil) })
+	}()
+}
+
+func planChangePrompt(cmd customCommand, path string) string {
+	return cmd.render("(derive the change name from the accepted plan at "+path+")") +
+		"\n\n**The accepted plan**: " + path +
+		" — read this file first; its contents are the plan to turn into an OpenSpec change.\n" +
+		"Do not re-litigate the plan's decisions: generate the artifacts from it."
 }
 
 func (a *app) startSessionAndPrompt(prompt, display string, att *acpclient.Attachment, mark int) {
@@ -718,6 +818,10 @@ func (a *app) nextMode() string {
 func (a *app) switchMode(mode string) {
 	prev := a.mode
 	a.mode = mode
+	if mode != modePlan {
+		a.planPath = ""
+		a.planReady = false
+	}
 	a.syncMenu()
 	a.win.Invalidate()
 	go func() {

@@ -14,10 +14,19 @@ type customCommand struct {
 	Description string
 	Content     string
 	AcceptsArgs bool
+	InjectArgs  bool
 }
 
 func (c customCommand) render(args string) string {
-	return strings.ReplaceAll(c.Content, "$ARGUMENTS", args)
+	if c.AcceptsArgs {
+		return strings.ReplaceAll(c.Content, "$ARGUMENTS", args)
+	}
+	if c.InjectArgs && args != "" {
+		return c.Content + "\n\n**Provided arguments**: " + args +
+			"\n\nTreat these arguments as the input to this workflow (e.g. the change name after " + c.Name +
+			"); if a name is given, use it exactly instead of picking a change yourself."
+	}
+	return c.Content
 }
 
 // discoverCommands reads the same folders as Maki: the user's config, the
@@ -32,6 +41,7 @@ func discoverCommands(cwd string) []customCommand {
 
 func discoverCommandsIn(cwd, home, config string) []customCommand {
 	byName := make(map[string]customCommand)
+	addOpsxSkills(byName, config)
 
 	addDir := func(dir string, project bool) {
 		entries, err := os.ReadDir(dir)
@@ -77,6 +87,45 @@ func discoverCommandsIn(cwd, home, config string) []customCommand {
 	}
 	sort.Slice(commands, func(i, j int) bool { return commands[i].Name < commands[j].Name })
 	return commands
+}
+
+// opsxSkills maps each /opsx:<id> command to the OpenSpec skill that backs it.
+// Discovery is the same as the opsx plugin: a command exists only when its
+// SKILL.md is on disk.
+var opsxSkills = []struct{ id, skill string }{
+	{"explore", "openspec-explore"},
+	{"propose", "openspec-propose"},
+	{"apply", "openspec-apply-change"},
+	{"update", "openspec-update-change"},
+	{"sync", "openspec-sync-specs"},
+	{"archive", "openspec-archive-change"},
+	{"new", "openspec-new-change"},
+	{"continue", "openspec-continue-change"},
+	{"ff", "openspec-ff-change"},
+	{"verify", "openspec-verify-change"},
+	{"bulk-archive", "openspec-bulk-archive-change"},
+	{"onboard", "openspec-onboard"},
+}
+
+// addOpsxSkills exposes the globally installed OpenSpec skills as /opsx:<id>
+// commands. It reads the same files the opsx plugin reads and adds no state of
+// its own: no skills on disk, no commands in the palette.
+func addOpsxSkills(byName map[string]customCommand, config string) {
+	if config == "" {
+		return
+	}
+	skills := filepath.Join(config, "maki", ".agents", "skills")
+	for _, o := range opsxSkills {
+		cmd, ok := readCommand(filepath.Join(skills, o.skill, "SKILL.md"), false)
+		if !ok {
+			continue
+		}
+		cmd.Name = "/opsx:" + o.id
+		cmd.Content = "The " + o.id + " workflow skill follows.\n\n" + cmd.Content
+		cmd.AcceptsArgs = strings.Contains(cmd.Content, "$ARGUMENTS")
+		cmd.InjectArgs = !cmd.AcceptsArgs
+		byName[bareName(cmd.Name)] = cmd
+	}
 }
 
 func bareName(display string) string {

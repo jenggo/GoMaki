@@ -43,6 +43,7 @@ func (a *app) view(c *ui.Context) {
 			col = a.transcriptView(c, t)
 		}
 		a.planPanel(c, t)
+		a.planAction(c, t)
 		a.composer(c, t)
 		a.statusBar(c, t)
 	})
@@ -71,8 +72,8 @@ func (a *app) copyOrClear(c *ui.Context) {
 // any other mode takes one from the rest of the palette, picked by name so it
 // stays the same across runs.
 var modeColors = map[string]ui.Color{
-	"build": ui.RGBA(217, 163, 0, 1),
-	"plan":  ui.RGBA(59, 130, 246, 1),
+	"build":  ui.RGBA(217, 163, 0, 1),
+	modePlan: ui.RGBA(59, 130, 246, 1),
 }
 
 var extraModeColors = []ui.Color{
@@ -333,30 +334,15 @@ func (a *app) entryView(c *ui.Context, col ui.Element, e *entry, t *ui.Theme, st
 }
 
 func (a *app) toolEntry(c *ui.Context, col ui.Element, e *entry, t *ui.Theme) {
-	expanded := e.Expanded
-	expandable := e.ToolInput != "" || e.ToolOutput != ""
+	todos := len(e.Todos) > 0
+	expandable := !todos && (e.ToolInput != "" || e.ToolOutput != "")
 	ui.Column(c).Gap(t.Space(1)).Padding(t.Space(2), t.Space(2.5)).Radius(t.Space(2)).Background(t.Surface).Border(1, t.Border).Children(func() {
-		row := ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center)
-		if expandable {
-			row = row.Cursor(ui.CursorPointer)
+		a.toolHeader(c, col, e, t, expandable)
+		if todos {
+			ui.Divider(c)
+			a.todoList(c, e.Todos, t)
+			return
 		}
-		row = row.ContextMenu(func(*ui.Menu) { a.copyTranscript(c, col) })
-		row.OnClick(func() { e.Expanded = !e.Expanded })
-		row.Children(func() {
-			if expandable {
-				ui.Text(c, chevron(expanded)).FontSize(t.Rem(0.8)).TextColor(t.TextMuted).IgnoreInput(true)
-			}
-			title := ui.Text(c, e.Text).Bold().FontSize(t.Rem(0.9))
-			badge := ui.Badge(c, statusLabel(e.Status)).Background(statusColor(t, e.Status)).
-				TextColor(statusTextColor(t, e.Status))
-			if expandable {
-				title.IgnoreInput(true)
-				badge.IgnoreInput(true)
-			} else {
-				a.copyable(c, col, title)
-				a.copyable(c, col, badge)
-			}
-		})
 		if !e.Expanded {
 			return
 		}
@@ -366,6 +352,43 @@ func (a *app) toolEntry(c *ui.Context, col ui.Element, e *entry, t *ui.Theme) {
 		}
 		if e.ToolOutput != "" {
 			a.toolBlock(c, col, "Output", e.ToolOutput, t)
+		}
+	})
+}
+
+func (a *app) toolHeader(c *ui.Context, col ui.Element, e *entry, t *ui.Theme, expandable bool) {
+	row := ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center)
+	if expandable {
+		row = row.Cursor(ui.CursorPointer)
+	}
+	row = row.ContextMenu(func(*ui.Menu) { a.copyTranscript(c, col) })
+	if expandable {
+		row.OnClick(func() { e.Expanded = !e.Expanded })
+	}
+	row.Children(func() {
+		if expandable {
+			ui.Text(c, chevron(e.Expanded)).FontSize(t.Rem(0.8)).TextColor(t.TextMuted).IgnoreInput(true)
+		}
+		title := ui.Text(c, e.Text).Bold().FontSize(t.Rem(0.9))
+		badge := ui.Badge(c, statusLabel(e.Status)).Background(statusColor(t, e.Status)).
+			TextColor(statusTextColor(t, e.Status))
+		if expandable {
+			title.IgnoreInput(true)
+			badge.IgnoreInput(true)
+		} else {
+			a.copyable(c, col, title)
+			a.copyable(c, col, badge)
+		}
+	})
+}
+
+func (a *app) todoList(c *ui.Context, todos []acpclient.PlanEntry, t *ui.Theme) {
+	ui.Column(c).Gap(t.Space(0.75)).Children(func() {
+		for _, p := range todos {
+			ui.Row(c).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, planIcon(p.Status)).FontSize(t.Rem(0.8)).TextColor(planColor(t, p.Status)).IgnoreInput(true)
+				ui.Text(c, p.Content).FontSize(t.Rem(0.85)).TextColor(planTextColor(t, p.Status)).Grow(1).MaxLines(2)
+			})
 		}
 	})
 }
@@ -533,6 +556,8 @@ const (
 	toolRunning   = "in_progress"
 	toolCompleted = "completed"
 	toolFailed    = "failed"
+	toolKindEdit  = "edit"
+	modePlan      = "plan"
 )
 
 func statusLabel(status string) string {
@@ -676,6 +701,26 @@ func (a *app) planPanel(c *ui.Context, t *ui.Theme) {
 					Grow(1).MaxLines(2).IgnoreInput(true)
 			})
 		}
+	})
+}
+
+// planAction offers the accepted plan to the OpenSpec fast-forward workflow.
+// It appears only after a plan-mode turn wrote a plan and the ff skill exists.
+func (a *app) planAction(c *ui.Context, t *ui.Theme) {
+	if !a.planReady {
+		return
+	}
+	ui.Row(c).Padding(t.Space(1), t.Space(3)).Gap(t.Space(2)).AlignItems(ui.Center).
+		BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Children(func() {
+		ui.Text(c, "Plan ready").FontSize(t.Rem(0.75)).Bold().TextColor(t.TextMuted).IgnoreInput(true)
+		row := ui.Row(c).Gap(t.Space(1)).Padding(t.Space(0.75), t.Space(1.5)).
+			Radius(t.Space(0.75)).Cursor(ui.CursorPointer).OnClick(a.sendPlanChange)
+		if row.Hovered() {
+			row = row.Background(t.SurfaceHover)
+		}
+		row.Children(func() {
+			ui.Text(c, "Create change from plan").FontSize(t.Rem(0.8)).IgnoreInput(true)
+		})
 	})
 }
 

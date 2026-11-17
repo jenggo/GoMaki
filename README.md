@@ -99,6 +99,16 @@ Type `/` in the composer and pick one. If you add a file while GoMaki is running
 
 Maki's built-in TUI commands such as `/help`, `/model`, `/new`, `/theme`, and `/sessions` are not exposed over ACP today. Use GoMaki's model menu, the mode in the status bar, and the session picker instead.
 
+### OpenSpec skills
+
+GoMaki also exposes the OpenSpec skills installed in Maki's config dir as `/opsx:<id>` commands:
+
+`/opsx:explore`, `/opsx:propose`, `/opsx:apply`, `/opsx:update`, `/opsx:sync`, `/opsx:archive`, `/opsx:new`, `/opsx:continue`, `/opsx:ff`, `/opsx:verify`, `/opsx:bulk-archive`, `/opsx:onboard`
+
+Discovery reads `~/.config/maki/.agents/skills/<skill>/SKILL.md`. A command exists only when its file is on disk, so a machine without OpenSpec installed shows none. The command sends the skill body as the prompt; arguments are appended when the body has no `$ARGUMENTS` placeholder. Run `openspec init` in the project once so the workflows have an `openspec/` root to write into.
+
+After a plan-mode turn writes its plan, a **Create change from plan** action appears above the composer when the fast-forward skill is installed. It switches the session to build mode and hands the plan file to `/opsx:ff`, so the change and its artifacts are generated in one pass.
+
 ## Limitations
 
 - ACP is the boundary. Anything Maki's TUI does without sending a prompt is not available here. That includes built-in slash commands and MCP prompts in the Maki version this was built against.

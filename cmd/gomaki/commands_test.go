@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/egoist/mygo/ui"
@@ -37,6 +38,47 @@ func TestDiscoverCommands(t *testing.T) {
 	}
 	if !cmd.AcceptsArgs || cmd.render("bar") != "Do bar now." {
 		t.Fatalf("render = %q", cmd.render("bar"))
+	}
+}
+
+func TestDiscoverOpsxSkills(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(dir, "config")
+	skills := filepath.Join(config, "maki", ".agents", "skills")
+	writeCommand(t, filepath.Join(skills, "openspec-propose", "SKILL.md"),
+		"---\nname: openspec-propose\ndescription: Propose a change\n---\nPropose body.\n")
+	writeCommand(t, filepath.Join(skills, "openspec-ff-change", "SKILL.md"),
+		"---\nname: openspec-ff-change\ndescription: Fast forward\n---\nFF body with $ARGUMENTS.\n")
+
+	cmds := discoverCommandsIn(dir, "", config)
+	if len(cmds) != 2 {
+		t.Fatalf("commands = %+v", cmds)
+	}
+	byName := make(map[string]customCommand)
+	for _, cmd := range cmds {
+		byName[cmd.Name] = cmd
+	}
+
+	propose, ok := byName["/opsx:propose"]
+	if !ok || propose.Description != "Propose a change" {
+		t.Fatalf("propose = %+v", propose)
+	}
+	if got := propose.render(""); got != "The propose workflow skill follows.\n\nPropose body." {
+		t.Fatalf("render without args = %q", got)
+	}
+	if got := propose.render("my-change"); !strings.Contains(got, "**Provided arguments**: my-change") {
+		t.Fatalf("render with args = %q", got)
+	}
+
+	ff, ok := byName["/opsx:ff"]
+	if !ok || !ff.AcceptsArgs {
+		t.Fatalf("ff = %+v", ff)
+	}
+	if got := ff.render("abc"); got != "The ff workflow skill follows.\n\nFF body with abc." {
+		t.Fatalf("ff render = %q", got)
 	}
 }
 

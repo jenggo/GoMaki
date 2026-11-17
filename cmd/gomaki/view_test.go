@@ -261,6 +261,35 @@ func TestToolCallExpands(t *testing.T) {
 	}
 }
 
+func TestTodoToolCallRendersList(t *testing.T) {
+	a := newTestApp()
+	input := `{"todos":[{"content":"write tests","status":"completed"},{"content":"ship it","status":"pending"}]}`
+	a.transcript = []entry{{
+		Kind:      entryTool,
+		Text:      "2 todos",
+		Status:    toolCompleted,
+		ToolInput: input,
+		Todos:     parseTodos(input),
+	}}
+	tt := ui.NewTester(a.view, 1000, 720)
+	if !tt.HasText("write tests") || !tt.HasText("ship it") {
+		t.Fatalf("todo items missing: %q", tt.Texts())
+	}
+	if tt.HasText(`"todos"`) {
+		t.Fatal("raw JSON shown for a todo tool call")
+	}
+}
+
+func TestParseTodos(t *testing.T) {
+	todos := parseTodos(`{"todos":[{"content":"a","status":"pending"}]}`)
+	if len(todos) != 1 || todos[0].Content != "a" || todos[0].Status != "pending" {
+		t.Fatalf("todos = %+v", todos)
+	}
+	if parseTodos(`{"path":"go.mod"}`) != nil {
+		t.Fatal("non-todo input parsed as todos")
+	}
+}
+
 func TestPromptDoneRestoresDraft(t *testing.T) {
 	a := newTestApp()
 	a.busy = true
@@ -549,6 +578,67 @@ func TestPlanPanelShowsProgressAndExpands(t *testing.T) {
 	tt.ClickAt(r.X+2, r.Y+r.H/2)
 	if !tt.HasText("first task") || !tt.HasText("third task") {
 		t.Fatalf("expanded panel missing tasks: %q", tt.Texts())
+	}
+}
+
+func TestPlanPathCapturedInPlanMode(t *testing.T) {
+	a := newTestApp()
+	a.mode = modePlan
+	a.apply(acpclient.Event{
+		Kind:       acpclient.EventToolCall,
+		ToolCallID: "t1",
+		Title:      "write plan",
+		ToolKind:   toolKindEdit,
+	})
+	a.apply(acpclient.Event{
+		Kind:       acpclient.EventToolCallUpdate,
+		ToolCallID: "t1",
+		ToolInput:  `{"path":"/state/plans/x.md","content":"plan"}`,
+	})
+	if a.planPath != "/state/plans/x.md" {
+		t.Fatalf("planPath = %q", a.planPath)
+	}
+	a.apply(acpclient.Event{
+		Kind:       acpclient.EventToolCall,
+		ToolCallID: "t2",
+		Title:      "read file",
+		ToolKind:   "read",
+		ToolInput:  `{"path":"/repo/x.go"}`,
+	})
+	if a.planPath != "/state/plans/x.md" {
+		t.Fatalf("read changed planPath to %q", a.planPath)
+	}
+}
+
+func TestPlanReadyAfterPlanTurn(t *testing.T) {
+	a := newTestApp()
+	a.mode = modePlan
+	a.commands = []customCommand{{Name: "/opsx:ff", Content: "FF body."}}
+	a.planPath = "/state/plans/x.md"
+	a.promptDone(acpclient.Event{StopReason: "end_turn"})
+	if !a.planReady {
+		t.Fatal("plan action missing after a plan turn")
+	}
+	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+	if !tt.HasText("Create change from plan") {
+		t.Fatalf("plan action not rendered: %q", tt.Texts())
+	}
+
+	a.planReady = false
+	a.commands = nil
+	a.promptDone(acpclient.Event{StopReason: "end_turn"})
+	if a.planReady {
+		t.Fatal("plan action shown without the ff command")
+	}
+}
+
+func TestPlanChangePrompt(t *testing.T) {
+	prompt := planChangePrompt(customCommand{Name: "/opsx:ff", Content: "FF body."}, "/state/plans/x.md")
+	for _, want := range []string{"FF body.", "/state/plans/x.md", "read this file first"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q: %q", want, prompt)
+		}
 	}
 }
 

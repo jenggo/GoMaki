@@ -47,6 +47,7 @@ type Event struct {
 	Text         string
 	ToolCallID   string
 	Title        string
+	ToolKind     string
 	Status       string
 	ToolInput    string
 	ToolOutput   string
@@ -423,6 +424,7 @@ func (c *Client) SessionUpdate(_ context.Context, n acp.SessionNotification) err
 			Kind:       EventToolCall,
 			ToolCallID: string(u.ToolCall.ToolCallId),
 			Title:      u.ToolCall.Title,
+			ToolKind:   string(u.ToolCall.Kind),
 			Status:     string(u.ToolCall.Status),
 			ToolInput:  renderValue(u.ToolCall.RawInput),
 			ToolOutput: renderValue(u.ToolCall.RawOutput),
