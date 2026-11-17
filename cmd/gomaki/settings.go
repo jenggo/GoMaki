@@ -23,7 +23,7 @@ type settings struct {
 
 var defaultSettings = settings{Size: 14, Theme: themeSystem}
 
-var fontSizes = []float32{12, 13, 14, 15, 16, 18, 20, 22, 24, 28}
+var fontSizes = []float32{10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28}
 
 func (a *app) loadSettings() {
 	a.settings = defaultSettings

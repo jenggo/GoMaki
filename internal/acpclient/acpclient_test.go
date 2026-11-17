@@ -33,7 +33,7 @@ func TestRealTurn(t *testing.T) {
 	if _, err := c.NewSession(cwd); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prompt("Use the read tool to read go.mod, then reply with the module name only."); err != nil {
+	if err := c.Prompt("Use the read tool to read go.mod, then reply with the module name only.", nil); err != nil {
 		t.Fatal(err)
 	}
 

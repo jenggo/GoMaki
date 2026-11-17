@@ -82,6 +82,26 @@ var themePalettes = map[string]palette{
 		background: "#eff1f5", surface: "#e6e9ef", border: "#ccd0da",
 		text: "#4c4f69", muted: "#7c7f93", accent: "#1e66f5", accentText: "#eff1f5",
 	},
+	"Rosé Pine Dawn": {
+		background: "#faf4ed", surface: "#fffaf3", border: "#dfdad9",
+		text: "#575279", muted: "#797593", accent: "#907aa9", accentText: colorWhite,
+	},
+	"Ayu Light": {
+		background: "#fafafa", surface: "#f3f4f5", border: "#d9d9d9",
+		text: "#5c6773", muted: "#828c99", accent: "#ff9940", accentText: colorWhite,
+	},
+	"Everforest Light": {
+		background: "#fdf6e3", surface: "#f4f0d9", border: "#e0dcc7",
+		text: "#5c6a72", muted: "#829181", accent: "#8da101", accentText: colorWhite,
+	},
+	"Tokyo Night Day": {
+		background: "#e1e2e7", surface: "#d0d5e3", border: "#b4b5b9",
+		text: "#3760bf", muted: "#6172b0", accent: "#2e7de9", accentText: colorWhite,
+	},
+	"PaperColor Light": {
+		background: "#eeeeee", surface: "#e4e4e4", border: "#d0d0d0",
+		text: "#444444", muted: "#878787", accent: "#0087af", accentText: colorWhite,
+	},
 }
 
 // themeNames lists the picker's choices: follow the desktop, then the dark
@@ -91,6 +111,7 @@ var themeNames = []string{
 	"One Dark", "GitHub Dark", "Dracula", "Nord", "Gruvbox Dark", "Tokyo Night",
 	"Solarized Dark", "Monokai", "Catppuccin Mocha",
 	"One Light", "GitHub Light", "Gruvbox Light", "Solarized Light", "Catppuccin Latte",
+	"Rosé Pine Dawn", "Ayu Light", "Everforest Light", "Tokyo Night Day", "PaperColor Light",
 }
 
 var themeCache = map[string]*ui.Theme{}

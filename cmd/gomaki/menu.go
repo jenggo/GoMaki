@@ -12,6 +12,15 @@ func (a *app) menu() *mygo.Menu {
 				Click: func(*mygo.MenuItem, *mygo.Window) { a.pickDirectory() }},
 			{ID: "open-session", Label: "Open Session…", Accelerator: "CmdOrCtrl+O", Disabled: !available,
 				Click: func(*mygo.MenuItem, *mygo.Window) { a.openSessions() }},
+			{ID: "attach", Label: "Attach Image or File…", Accelerator: "CmdOrCtrl+Shift+A", Disabled: !available,
+				Click: func(*mygo.MenuItem, *mygo.Window) { a.attachFile() }},
+			{ID: "reload", Label: "Reload", Accelerator: "CmdOrCtrl+R",
+				Click: func(*mygo.MenuItem, *mygo.Window) { a.reload() }},
+			{ID: "running", Label: "Running Tasks…", Accelerator: "CmdOrCtrl+Shift+B",
+				Click: func(*mygo.MenuItem, *mygo.Window) {
+					a.runningOpen = true
+					a.win.Invalidate()
+				}},
 			{Label: "Reload Commands", Click: func(*mygo.MenuItem, *mygo.Window) {
 				a.loadCommands()
 				a.win.Invalidate()
@@ -26,7 +35,9 @@ func (a *app) menu() *mygo.Menu {
 		}},
 		{Role: mygo.RoleEditMenu},
 		{ID: "model-menu", Label: "Model", Submenu: a.modelItems()},
-		{ID: "mode-menu", Label: "Mode", Submenu: a.modeItems()},
+		{Label: "Help", Submenu: []*mygo.MenuItem{
+			{ID: "about", Label: "About GoMaki", Click: func(*mygo.MenuItem, *mygo.Window) { a.showAbout() }},
+		}},
 	})
 }
 
@@ -56,24 +67,6 @@ func (a *app) modelItems() []*mygo.MenuItem {
 			Checked: model == a.model,
 			Click: func(*mygo.MenuItem, *mygo.Window) {
 				a.switchModel(model)
-			},
-		})
-	}
-	return items
-}
-
-func (a *app) modeItems() []*mygo.MenuItem {
-	if len(a.modes) == 0 {
-		return []*mygo.MenuItem{{Label: "No modes available", Disabled: true}}
-	}
-	items := make([]*mygo.MenuItem, 0, len(a.modes))
-	for _, mode := range a.modes {
-		items = append(items, &mygo.MenuItem{
-			Label:   modeLabel(mode),
-			Type:    mygo.MenuItemRadio,
-			Checked: mode == a.mode,
-			Click: func(*mygo.MenuItem, *mygo.Window) {
-				a.switchMode(mode)
 			},
 		})
 	}

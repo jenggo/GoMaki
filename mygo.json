@@ -3,5 +3,6 @@
   "slug": "gomaki",
   "identifier": "dev.jenggo.gomaki",
   "version": "0.1.0",
+  "icon": "cmd/gomaki/icon.png",
   "main": "./cmd/gomaki"
 }

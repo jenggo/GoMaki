@@ -2,11 +2,14 @@ package acpclient
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,14 +134,23 @@ type SessionInfo struct {
 
 const modelConfigID acp.SessionConfigId = "model"
 
+// Attachment is a file sent with a prompt: an image if MimeType is an
+// image type, otherwise a link the agent can open itself.
+type Attachment struct {
+	Path     string
+	MimeType string
+	Data     []byte
+}
+
 // Client spawns `maki acp` and speaks ACP to it.
 type Client struct {
-	cmd       *exec.Cmd
-	conn      *acp.ClientSideConnection
-	events    chan Event
-	wake      chan struct{}
-	sessionID acp.SessionId
-	modelID   acp.SessionConfigId
+	cmd          *exec.Cmd
+	conn         *acp.ClientSideConnection
+	events       chan Event
+	wake         chan struct{}
+	sessionID    acp.SessionId
+	modelID      acp.SessionConfigId
+	imageSupport bool
 }
 
 // Start spawns and initializes the agent process.
@@ -167,7 +179,7 @@ func Start() (*Client, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err = c.conn.Initialize(ctx, acp.InitializeRequest{
+	resp, err := c.conn.Initialize(ctx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		ClientInfo:      &acp.Implementation{Name: "gomaki", Version: "0.1.0"},
 		ClientCapabilities: acp.ClientCapabilities{
@@ -178,6 +190,7 @@ func Start() (*Client, error) {
 		_ = c.Close()
 		return nil, fmt.Errorf("initialize maki acp: %w", err)
 	}
+	c.imageSupport = resp.AgentCapabilities.PromptCapabilities.Image
 	return c, nil
 }
 
@@ -195,6 +208,9 @@ func (c *Client) Close() error {
 	}
 	return c.cmd.Process.Kill()
 }
+
+// SupportsImages reports whether the agent takes images in a prompt.
+func (c *Client) SupportsImages() bool { return c.imageSupport }
 
 // NewSession creates a session for cwd.
 func (c *Client) NewSession(cwd string) (Session, error) {
@@ -257,18 +273,33 @@ func (c *Client) ListSessions(cwd string) ([]SessionInfo, error) {
 
 // Prompt sends a user prompt and streams the turn through the event channel.
 // It returns once the prompt is accepted; the turn ends with EventPromptDone.
-func (c *Client) Prompt(text string) error {
+func (c *Client) Prompt(text string, att *Attachment) error {
 	if c.sessionID == "" {
 		return errors.New("no active session")
+	}
+	blocks := []acp.ContentBlock{acp.TextBlock(text)}
+	if att != nil {
+		blocks = append(blocks, c.attachmentBlock(att))
 	}
 	go func() {
 		resp, err := c.conn.Prompt(context.Background(), acp.PromptRequest{
 			SessionId: c.sessionID,
-			Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: text}}},
+			Prompt:    blocks,
 		})
 		c.emit(Event{Kind: EventPromptDone, Err: err, StopReason: string(resp.StopReason)})
 	}()
 	return nil
+}
+
+func (c *Client) attachmentBlock(att *Attachment) acp.ContentBlock {
+	if strings.HasPrefix(att.MimeType, "image/") && c.imageSupport {
+		return acp.ImageBlock(base64.StdEncoding.EncodeToString(att.Data), att.MimeType)
+	}
+	link := acp.ResourceLinkBlock(filepath.Base(att.Path), (&url.URL{Scheme: "file", Path: att.Path}).String())
+	link.ResourceLink.MimeType = &att.MimeType
+	size := len(att.Data)
+	link.ResourceLink.Size = &size
+	return link
 }
 
 // Cancel stops the running turn.

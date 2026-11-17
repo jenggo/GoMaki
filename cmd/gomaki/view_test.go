@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 
@@ -10,7 +11,7 @@ import (
 )
 
 func newTestApp() *app {
-	return &app{planIndex: -1, sessionPick: -1, settings: defaultSettings}
+	return newApp()
 }
 
 func TestViewRendersTranscript(t *testing.T) {
@@ -335,20 +336,16 @@ func TestRewindLastTurn(t *testing.T) {
 	a.transcript = []entry{
 		{Kind: entryUser, Text: "first"},
 		{Kind: entryAgent, Text: "answer one"},
-		{Kind: entryPlan, Plan: []acpclient.PlanEntry{{Content: "step", Status: toolCompleted}}},
 		{Kind: entryUser, Text: "lorem ipsum"},
 		{Kind: entryAgent, Text: "answer two"},
 		{Kind: entryTool, Text: "bash", Status: toolCompleted},
 	}
 	a.rewindLastTurn()
-	if len(a.transcript) != 3 {
+	if len(a.transcript) != 2 {
 		t.Fatalf("transcript len = %d", len(a.transcript))
 	}
 	if a.prompt != "lorem ipsum" || a.notice != "Last prompt restored" {
 		t.Fatalf("prompt = %q notice = %q", a.prompt, a.notice)
-	}
-	if a.planIndex != 2 {
-		t.Fatalf("planIndex = %d", a.planIndex)
 	}
 }
 
@@ -374,7 +371,7 @@ func TestUsageInStatusBar(t *testing.T) {
 	a.contextUsed = 27394
 	a.contextSize = 200000
 	tt := ui.NewTester(a.view, 1000, 720)
-	if !tt.HasText("ctx 27.4k/200k") {
+	if !tt.HasText("27.4k/200k (14%)") {
 		t.Fatalf("missing usage in %q", tt.Texts())
 	}
 }
@@ -399,5 +396,182 @@ func TestThoughtCollapsesAndExpands(t *testing.T) {
 	}
 	if !tt.HasText("line1") {
 		t.Fatalf("expanded thought missed its start: %q", tt.Texts())
+	}
+}
+
+func TestEagerSessionFillsMenusAndKeepsSessionList(t *testing.T) {
+	a := newTestApp()
+	a.client = &acpclient.Client{}
+	a.sessions = []acpclient.SessionInfo{{ID: "old", Title: "Earlier work"}}
+	a.applySession(acpclient.Session{
+		ID:     "new",
+		Model:  "acme/fast",
+		Models: []string{"acme/fast"},
+		Mode:   "build",
+		Modes:  []string{"build", "plan"},
+	})
+
+	tt := ui.NewTester(a.view, 1000, 720)
+	if !tt.HasText("Previous sessions") {
+		t.Fatalf("first screen lost its session list: %q", tt.Texts())
+	}
+	models := a.modelItems()
+	if len(models) != 1 || models[0].Label != "acme/fast" {
+		t.Fatalf("models = %+v", models)
+	}
+	if next := a.nextMode(); next != "plan" {
+		t.Fatalf("next mode = %q, want plan", next)
+	}
+	if !tt.HasText("Build") {
+		t.Fatalf("status bar lost the mode: %q", tt.Texts())
+	}
+}
+
+func TestElicitationShowsWholeOptionText(t *testing.T) {
+	a := newTestApp()
+	long := "Just assessing — no current pain - Exploring the option space. Then the honest answer is: don't do it yet, the embedded mode is fine."
+	a.elicitation = &acpclient.ElicitationRequest{
+		Reply: make(chan acpclient.ElicitationReply, 1),
+		Fields: []acpclient.ElicitationField{{
+			Name:  "driver",
+			Title: "What's the actual driver for horizontal scale here?",
+			Options: []acpclient.ElicitationOption{
+				{Value: "fleet", Label: "Fleet size — one emak can't hold all agent connections"},
+				{Value: "assess", Label: long},
+			},
+		}},
+	}
+	a.elicitationOpen = true
+	a.answers = map[string]string{}
+	a.multiAnswers = map[string]map[string]bool{}
+
+	tt := ui.NewTester(a.view, 1000, 760)
+	if !tt.HasText(long) {
+		t.Fatalf("option text was cut: %q", tt.Texts())
+	}
+	r, ok := tt.Find(long)
+	if !ok {
+		t.Fatal("option row not found")
+	}
+	tt.ClickAt(r.X+r.W/2, r.Y+r.H/2)
+	if a.answers["driver"] != long {
+		t.Fatalf("answer = %q", a.answers["driver"])
+	}
+}
+
+func TestModeColorsAreDistinct(t *testing.T) {
+	build, plan := modeColor("build"), modeColor("plan")
+	if build == plan {
+		t.Fatal("build and plan share a color")
+	}
+	extra := modeColor("review")
+	if extra == build || extra == plan {
+		t.Fatalf("extra mode color %v clashes with a known mode", extra)
+	}
+	if modeColor("review") != extra {
+		t.Fatal("unknown mode color is not stable")
+	}
+}
+
+func TestCtrlCCopiesSelection(t *testing.T) {
+	a := newTestApp()
+	a.client = &acpclient.Client{}
+	a.transcript = []entry{{Kind: entryAgent, Text: "copy this sentence"}}
+	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+
+	r, ok := tt.Find("copy this sentence")
+	if !ok {
+		t.Fatalf("transcript text not found: %q", tt.Texts())
+	}
+	tt.Press(r.X+2, r.Y+r.H/2)
+	tt.Move(r.X+r.W-2, r.Y+r.H/2)
+	tt.Release(r.X+r.W-2, r.Y+r.H/2)
+	tt.Frame()
+	if a.selectedText == "" {
+		t.Fatal("selection was not captured")
+	}
+
+	tt.Key(ui.Cmd, ui.KeyC)
+	tt.Frame()
+	if got := tt.Clipboard(); got != "copy this sentence" {
+		t.Fatalf("clipboard = %q", got)
+	}
+}
+
+func TestCtrlCWithComposerFocusedCopiesSelection(t *testing.T) {
+	a := newTestApp()
+	a.client = &acpclient.Client{}
+	a.transcript = []entry{{Kind: entryAgent, Text: "copy this sentence"}}
+	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+	tt.Type("draft")
+	a.selectedText = "copy this sentence"
+
+	tt.Key(ui.Cmd, ui.KeyC)
+	tt.Frame()
+	if a.prompt != "draft" {
+		t.Fatalf("composer cleared despite a selection: %q", a.prompt)
+	}
+	if got := tt.Clipboard(); got != "copy this sentence" {
+		t.Fatalf("clipboard = %q", got)
+	}
+}
+
+func TestCodeFence(t *testing.T) {
+	if got := codeFence(`{"a": 1}`); !strings.HasPrefix(got, "```json\n") {
+		t.Fatalf("json fence = %q", got)
+	}
+	if got := codeFence("a ``` b"); !strings.HasPrefix(got, "````\n") {
+		t.Fatalf("backtick fence = %q", got)
+	}
+}
+
+func TestPlanPanelShowsProgressAndExpands(t *testing.T) {
+	a := newTestApp()
+	a.plan = []acpclient.PlanEntry{
+		{Content: "first task", Status: toolCompleted},
+		{Content: "second task", Status: toolRunning},
+		{Content: "third task", Status: toolPending},
+	}
+	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+	if !tt.HasText("Tasks 1 of 3") {
+		t.Fatalf("progress header missing: %q", tt.Texts())
+	}
+	if tt.HasText("first task") || tt.HasText("third task") {
+		t.Fatal("collapsed panel showed the full list")
+	}
+	r, ok := tt.Find("Tasks 1 of 3")
+	if !ok {
+		t.Fatal("header not found")
+	}
+	tt.ClickAt(r.X+2, r.Y+r.H/2)
+	if !tt.HasText("first task") || !tt.HasText("third task") {
+		t.Fatalf("expanded panel missing tasks: %q", tt.Texts())
+	}
+}
+
+func TestRunningDialogListsRunningTools(t *testing.T) {
+	a := newTestApp()
+	a.transcript = []entry{
+		{Kind: entryTool, Text: "delegate research", Status: toolRunning, Started: time.Now()},
+		{Kind: entryTool, Text: "read go.mod", Status: toolCompleted},
+	}
+	if got := len(a.runningTools()); got != 1 {
+		t.Fatalf("runningTools = %d, want 1", got)
+	}
+	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+	if !tt.HasText("1 running") {
+		t.Fatalf("status bar has no running count: %q", tt.Texts())
+	}
+	r, ok := tt.Find("1 running")
+	if !ok {
+		t.Fatal("running count not found")
+	}
+	tt.ClickAt(r.X+2, r.Y+r.H/2)
+	if !tt.HasText("Tool calls still in progress.") {
+		t.Fatal("running dialog did not open")
 	}
 }

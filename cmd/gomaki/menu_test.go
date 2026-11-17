@@ -20,11 +20,10 @@ func TestMenuItems(t *testing.T) {
 	if !models.Submenu[1].Checked || models.Submenu[0].Checked {
 		t.Fatalf("model checks = %+v %+v", models.Submenu[0], models.Submenu[1])
 	}
-	modes := m.ItemByID("mode-menu")
-	if modes == nil || len(modes.Submenu) != 2 {
-		t.Fatalf("mode items = %+v", modes)
+	if m.ItemByID("mode-menu") != nil {
+		t.Fatal("mode menu should be gone; the status bar switches mode")
 	}
-	if !modes.Submenu[1].Checked || modes.Submenu[1].Label != "Plan" {
-		t.Fatalf("mode checks = %+v", modes.Submenu[1])
+	if m.ItemByID("about") == nil {
+		t.Fatal("about item missing")
 	}
 }

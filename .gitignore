@@ -1,2 +1,4 @@
 *.md
 !README.md
+internal/version/version_gen.go
+dist/
