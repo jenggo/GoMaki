@@ -35,12 +35,12 @@ func TestElicitationHandoff(t *testing.T) {
 		e.Elicitation.Reply <- ElicitationReply{Answers: map[string]any{"q1": "A"}}
 	}()
 
-	resp, err := c.UnstableCreateElicitation(context.Background(), acp.UnstableCreateElicitationRequest{
-		Form: &acp.UnstableCreateElicitationForm{
+	resp, err := c.CreateElicitation(context.Background(), acp.CreateElicitationRequest{
+		Form: &acp.CreateElicitationForm{
 			Message: "Pick",
-			RequestedSchema: acp.UnstableElicitationSchema{
-				Properties: map[string]any{
-					"q1": map[string]any{"type": "string", "title": "Choose"},
+			RequestedSchema: acp.ElicitationSchema{
+				Properties: map[string]acp.ElicitationPropertySchema{
+					"q1": {String: &acp.ElicitationPropertySchemaString{Title: new("Choose")}},
 				},
 			},
 		},
@@ -48,7 +48,7 @@ func TestElicitationHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Accept == nil || resp.Accept.Content["q1"] != "A" {
+	if resp.Accept == nil || resp.Accept.Content["q1"].String == nil || *resp.Accept.Content["q1"].String != "A" {
 		t.Fatalf("response = %+v", resp)
 	}
 }

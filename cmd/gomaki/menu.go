@@ -5,10 +5,12 @@ import "github.com/egoist/mygo"
 // menu builds the window's menu bar: the actions, the editing commands of
 // the focused field, and the live model and mode choices.
 func (a *app) menu() *mygo.Menu {
-	available := a.client != nil
+	available := a.connected
 	return mygo.NewMenu([]*mygo.MenuItem{
 		{Label: "File", Submenu: []*mygo.MenuItem{
-			{ID: "new-session", Label: "New Session…", Accelerator: "CmdOrCtrl+N", Disabled: !available,
+			{ID: "new-session", Label: "New Session", Accelerator: "CmdOrCtrl+N", Disabled: !available,
+				Click: func(*mygo.MenuItem, *mygo.Window) { a.startNewSession(a.cwd) }},
+			{ID: "open-directory", Label: "Open Directory…", Accelerator: "CmdOrCtrl+Shift+O", Disabled: !available,
 				Click: func(*mygo.MenuItem, *mygo.Window) { a.pickDirectory() }},
 			{ID: "open-session", Label: "Open Session…", Accelerator: "CmdOrCtrl+O", Disabled: !available,
 				Click: func(*mygo.MenuItem, *mygo.Window) { a.openSessions() }},
@@ -26,6 +28,10 @@ func (a *app) menu() *mygo.Menu {
 				a.win.Invalidate()
 			}},
 			mygo.Separator(),
+			{ID: "http-mode", Label: "HTTP Mode", Disabled: a.httpMode || !available,
+				Click: func(*mygo.MenuItem, *mygo.Window) {
+					a.toggleHTTPMode()
+				}},
 			{ID: "settings", Label: "Settings…", Accelerator: "CmdOrCtrl+,", Click: func(*mygo.MenuItem, *mygo.Window) {
 				a.settingsOpen = true
 				a.win.Invalidate()

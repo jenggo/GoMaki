@@ -52,13 +52,34 @@ go build -o gomaki ./cmd/gomaki
 ./gomaki
 ```
 
+`make build` does the same after rebuilding the embedded web frontend, and writes `dist/gomaki`:
+
+```sh
+make build
+./dist/gomaki
+```
+
 Add `-c` to continue the most recent session in the current folder:
 
 ```sh
 ./gomaki -c
 ```
 
-Launch it from the project you want to work in. The session list starts there. File > New Session can point a new session at another folder.
+Launch it from the project you want to work in. The session list starts there. File > New Session starts a new session in that folder; File > Open Directory picks another folder and respawns the agent there.
+
+## HTTP Mode
+
+Use the same session from a phone or tablet:
+
+```sh
+./gomaki -password 'your-password'
+```
+
+Passing `-password` starts HTTP Mode with the app, so the window shows the reachable URL(s) and a Cancel button. The server binds `0.0.0.0`; add `--listen <addr>` to restrict the interface and `--port <n>` to choose a port.
+
+Without `-password`, File > HTTP Mode still works: it binds `127.0.0.1` only and skips the login page. It does not prompt for a password before starting. That mode serves plain HTTP, because browsers treat loopback as a secure context, so there is no certificate warning to accept.
+
+With `-password` the server uses TLS. The certificate is self-signed and generated on first use. Accept the browser warning once per device. The web UI follows the system light/dark preference and has a toggle in the header.
 
 ## First open
 
@@ -80,7 +101,11 @@ If `maki` is missing, the window stays open and shows the error at the top. Inst
 | Cmd+R | Reload the app and resume the current session |
 | Cmd+Shift+B | Open the running-tasks window |
 | `/` | Open the custom command palette |
+| Up / Down | Move the palette highlight |
+| Enter | Select the highlighted command, or send the composer text |
+| Ctrl+Q | Pull the first queued prompt back into the composer |
 | `/reload` | Reload the app and resume the current session |
+| `/new` | Start a new session in the current working directory |
 | Click a tool call | Expand or collapse its input and output |
 
 Esc twice on an empty composer removes the transcript from the last user message onward and puts that message back in the composer. This is a UI rewind. ACP has no history rewind, so Maki's own context still contains the turn you removed.
@@ -97,15 +122,15 @@ Commands are Markdown files. Frontmatter can set `name` and `description`. `$ARG
 
 Type `/` in the composer and pick one. If you add a file while GoMaki is running, use File > Reload Commands. The transcript shows the command line; Maki receives the expanded prompt.
 
-Maki's built-in TUI commands such as `/help`, `/model`, `/new`, `/theme`, and `/sessions` are not exposed over ACP today. Use GoMaki's model menu, the mode in the status bar, and the session picker instead.
+Maki's built-in TUI commands such as `/help`, `/model`, `/theme`, `/sessions`, and `/compact` are not exposed over ACP today. `/new` is a GoMaki built-in, handled before the prompt reaches the agent. Use GoMaki's model menu, the mode in the status bar, and the session picker instead. `/compact` cannot be run over ACP: the agent builds a plain prompt from the text, so it would reach the model literally.
 
 ### OpenSpec skills
 
-GoMaki also exposes the OpenSpec skills installed in Maki's config dir as `/opsx:<id>` commands:
+GoMaki also exposes the globally installed OpenSpec skills as `/opsx:<id>` commands:
 
 `/opsx:explore`, `/opsx:propose`, `/opsx:apply`, `/opsx:update`, `/opsx:sync`, `/opsx:archive`, `/opsx:new`, `/opsx:continue`, `/opsx:ff`, `/opsx:verify`, `/opsx:bulk-archive`, `/opsx:onboard`
 
-Discovery reads `~/.config/maki/.agents/skills/<skill>/SKILL.md`. A command exists only when its file is on disk, so a machine without OpenSpec installed shows none. The command sends the skill body as the prompt; arguments are appended when the body has no `$ARGUMENTS` placeholder. Run `openspec init` in the project once so the workflows have an `openspec/` root to write into.
+Discovery reads `~/.agents/skills/<skill>/SKILL.md`, the same global location Maki's `opsx.lua` uses. A command exists only when its file is on disk, so a machine without OpenSpec installed shows none. The command sends the skill body as the prompt; arguments are appended when the body has no `$ARGUMENTS` placeholder. Run `openspec init` in the project once so the workflows have an `openspec/` root to write into.
 
 After a plan-mode turn writes its plan, a **Create change from plan** action appears above the composer when the fast-forward skill is installed. It switches the session to build mode and hands the plan file to `/opsx:ff`, so the change and its artifacts are generated in one pass.
 
@@ -113,7 +138,7 @@ After a plan-mode turn writes its plan, a **Create change from plan** action app
 
 - ACP is the boundary. Anything Maki's TUI does without sending a prompt is not available here. That includes built-in slash commands and MCP prompts in the Maki version this was built against.
 - Background jobs and delegated agents are only visible as far as Maki reports them over ACP. A subagent arrives as a tool call; a background job that outlives its tool call may only show up again when its result lands in the conversation. The running-tasks window lists tool calls still marked in progress.
-- The session list follows the current working folder. It starts as the folder you launched from; File > New Session can change it.
+- The session list follows the current working folder. It starts as the folder you launched from; File > Open Directory changes it.
 - A session that is already open in another Maki process cannot be loaded. GoMaki shows the error instead of closing silently.
 - Esc rewind only changes the transcript and the composer. Maki's context is not rolled back.
 - Permission and question dialogs depend on what the agent sends over ACP.

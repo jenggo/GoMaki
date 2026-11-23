@@ -1,11 +1,8 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -16,6 +13,7 @@ import (
 	"github.com/egoist/mygo/ui/markdown"
 
 	"gomaki/internal/acpclient"
+	"gomaki/internal/session"
 	"gomaki/internal/version"
 )
 
@@ -24,6 +22,7 @@ func newApp() *app {
 		sessionPick: -1,
 		settings:    defaultSettings,
 		md:          markdown.Options{ShareSelection: true},
+		toolMD:      markdown.Options{ShareSelection: true, WrapCode: true},
 	}
 }
 
@@ -40,12 +39,14 @@ type entry struct {
 	Started    time.Time
 	Text       string
 	ToolID     string
+	ToolName   string
 	Status     string
 	ToolInput  string
 	ToolOutput string
 	ToolKind   string
 	Todos      []acpclient.PlanEntry
 	Kind       entryKind
+	TodoList   bool
 	Expanded   bool
 }
 
@@ -53,9 +54,8 @@ type app struct {
 	scroll ui.ScrollState
 	escAt  time.Time
 
-	win    *mygo.Window
-	client *acpclient.Client
-	events <-chan acpclient.Event
+	win  *mygo.Window
+	core *session.Core
 
 	permission *acpclient.PermissionRequest
 
@@ -65,10 +65,12 @@ type app struct {
 
 	attach *acpclient.Attachment
 
-	md markdown.Options
+	webServer *webServer
+
+	md     markdown.Options
+	toolMD markdown.Options
 
 	notice      string
-	lastPrompt  string
 	commandsCwd string
 
 	cwd       string
@@ -88,41 +90,61 @@ type app struct {
 
 	selectedText string
 
-	copyPending string
+	copyPending  string
+	toastPending string
+
+	planPath string
+
+	password string
+	listen   string
+	httpErr  string
+
+	todoToolID    string
+	todoDismissed string
 
 	sessionsList ui.ListState
 
+	paletteList ui.ListState
+
 	settings settings
 
-	commands []customCommand
+	commands    []customCommand
+	acpCommands []acpclient.Command
 
 	transcript []entry
 
 	models []string
 	modes  []string
 
-	sessions  []acpclient.SessionInfo
-	families  []string
-	plan      []acpclient.PlanEntry
-	planPath  string
+	sessions []acpclient.SessionInfo
+	families []string
+	plan     []acpclient.PlanEntry
+	queue    []session.QueuedPrompt
+
+	httpURLs []string
+
+	sessionPick  int
+	paletteIndex int
+
+	contextUsed int64
+	contextSize int64
+	costAmount  float64
+	port        int
+
+	connected bool
+
 	planReady bool
 
-	sessionPick int
-
-	contextUsed  int
-	contextSize  int
-	costAmount   float64
 	planExpanded bool
+	todoExpanded bool
 
 	continueLast bool
 	focusInput   bool
 
 	sessionsLoading bool
 
-	stopping       bool
 	busy           bool
 	resumed        bool
-	configSeen     bool
 	permissionOpen bool
 	menuQueued     bool
 	resumeOpen     bool
@@ -132,21 +154,22 @@ type app struct {
 	settingsOpen    bool
 	runningOpen     bool
 	quitting        bool
+
+	httpMode bool
 }
 
 func (a *app) startup() {
-	a.refreshBranch()
 	go func() {
-		c, err := acpclient.Start()
-		if err != nil {
+		core := session.New()
+		if err := core.Start(a.cwd); err != nil {
 			a.win.Update(func() {
 				a.err = "Cannot start Maki. Check that it is installed and on PATH.\n" + err.Error()
 			})
 			return
 		}
 		a.win.Update(func() {
-			a.client = c
-			a.events = c.Events()
+			a.core = core
+			a.connected = true
 			a.status = ""
 			a.syncMenu()
 			if a.continueLast {
@@ -157,26 +180,204 @@ func (a *app) startup() {
 				// for a session, so this fills the menus before the first prompt.
 				a.startNewSession(a.cwd)
 			}
+			if a.password != "" {
+				a.startHTTP()
+			}
 		})
-		go a.pump(c)
+		go a.watch(core)
 	}()
 }
 
-func (a *app) pump(c *acpclient.Client) {
-	for range c.Wake() {
-		a.win.Invalidate()
-	}
-}
-
-func (a *app) drain() {
+// watch applies core updates to the app's mirror and runs the side effects
+// that need the main thread.
+func (a *app) watch(core *session.Core) {
 	for {
-		select {
-		case e := <-a.events:
-			a.apply(e)
-		default:
+		ch := core.Subscribe()
+		for u := range ch {
+			if u.Dirty {
+				u.State = core.Snapshot()
+			}
+			a.handleUpdate(u)
+		}
+		if core.Closed() {
 			return
 		}
 	}
+}
+
+func (a *app) handleUpdate(u session.Update) {
+	switch u.Kind {
+	case session.UpdateReset:
+		a.win.Update(a.clearUI)
+	case session.UpdateRestoreDraft:
+		a.win.Update(func() { a.prompt = u.Text })
+	case session.UpdateEvent:
+		a.handleEvent(u)
+	case session.UpdateState:
+		a.win.Update(func() {
+			a.models = u.State.Models
+			a.modes = u.State.Modes
+			a.model = u.State.Model
+			a.mode = u.State.Mode
+			if u.State.Err != "" {
+				a.err = u.State.Err
+			}
+			a.syncMenu()
+		})
+	case session.UpdateSnapshot:
+	}
+	a.win.Invalidate()
+}
+
+func (a *app) handleEvent(u session.Update) {
+	switch u.Event.Kind {
+	case acpclient.EventPermission:
+		a.win.Update(func() {
+			a.permissionOpen = true
+			title := u.Event.Permission.Title
+			if title == "" {
+				title = "Permission required"
+			}
+			a.notify(appName, title)
+		})
+	case acpclient.EventElicitation:
+		a.win.Update(func() { a.startElicitation(u.Event.Elicitation) })
+	case acpclient.EventConfig:
+		a.win.Update(func() {
+			a.models = u.Event.Models
+			if u.Event.Model != "" {
+				a.model = u.Event.Model
+			}
+			a.syncMenu()
+		})
+	case acpclient.EventMode:
+		a.win.Update(func() {
+			a.mode = u.Event.Mode
+			a.syncMenu()
+		})
+	case acpclient.EventPromptDone:
+		a.win.Update(func() {
+			a.notice = u.State.Notice
+			a.escAt = time.Time{}
+			if u.State.Err != "" {
+				a.err = u.State.Err
+			}
+		})
+		if u.State.Notice == "" {
+			a.notify(appName, "Turn finished.")
+		}
+	case acpclient.EventUserText, acpclient.EventText, acpclient.EventThought,
+		acpclient.EventToolCall, acpclient.EventToolCallUpdate, acpclient.EventPlan,
+		acpclient.EventUsage, acpclient.EventCommands:
+	}
+}
+
+// clearUI drops the renderer-local state a session reset invalidates.
+func (a *app) clearUI() {
+	a.prompt = ""
+	a.err = ""
+	a.notice = ""
+	a.escAt = time.Time{}
+	a.scroll = ui.ScrollState{}
+	a.sessionPick = -1
+	a.paletteIndex = 0
+	a.planExpanded = false
+	a.todoToolID = ""
+	a.todoExpanded = false
+	a.todoDismissed = ""
+	a.permissionOpen = false
+	a.elicitationOpen = false
+	a.answers = nil
+	a.multiAnswers = nil
+	a.clearAttachment()
+}
+
+// mirror copies the core snapshot into the app's fields. The core is the
+// source of truth; these fields are a per-frame cache for the renderers.
+func (a *app) mirror() {
+	if a.core == nil {
+		return
+	}
+	s := a.core.Snapshot()
+	a.transcript = a.mergeTranscript(s.Transcript)
+	a.plan = s.Plan
+	a.models = s.Models
+	a.modes = s.Modes
+	a.model = s.Model
+	a.mode = s.Mode
+	a.busy = s.Busy
+	a.status = s.Status
+	a.sessionID = s.SessionID
+	a.cwd = s.Cwd
+	a.branch = s.Branch
+	a.contextUsed = s.ContextUsed
+	a.contextSize = s.ContextSize
+	a.costAmount = s.CostAmount
+	a.costCurrency = s.CostCurrency
+	a.planPath = s.PlanPath
+	a.planReady = s.PlanReady
+	a.sessions = s.Sessions
+	a.acpCommands = s.Commands
+	a.permission = s.Permission
+	a.elicitation = s.Elicitation
+	a.resumed = s.Resumed
+	a.queue = s.Queue
+}
+
+// mergeTranscript converts the core transcript and keeps the renderer-local
+// expansion state.
+func (a *app) mergeTranscript(src []session.Entry) []entry {
+	expanded := make(map[string]bool)
+	for _, e := range a.transcript {
+		if e.Kind == entryTool && e.Expanded {
+			expanded[e.ToolID] = true
+		}
+	}
+	out := make([]entry, len(src))
+	for i, e := range src {
+		out[i] = entry{
+			Started:    e.Started,
+			Text:       e.Text,
+			ToolID:     e.ToolID,
+			ToolName:   e.ToolName,
+			Status:     e.Status,
+			ToolInput:  e.ToolInput,
+			ToolOutput: e.ToolOutput,
+			ToolKind:   e.ToolKind,
+			Todos:      e.Todos,
+			TodoList:   e.TodoList,
+			Kind:       entryKind(e.Kind),
+		}
+		if e.Kind == session.EntryTool {
+			out[i].Expanded = expanded[e.ToolID]
+		} else if i < len(a.transcript) && a.transcript[i].Kind == out[i].Kind {
+			out[i].Expanded = a.transcript[i].Expanded
+		}
+	}
+	return out
+}
+
+// syncTodo pins the newest todo list and resets the panel when a new list
+// replaces it.
+func (a *app) syncTodo() {
+	id, _, ok := a.latestTodos()
+	if !ok || id == "" || id == a.todoToolID {
+		return
+	}
+	a.todoToolID = id
+	a.todoExpanded = false
+	a.todoDismissed = ""
+}
+
+// latestTodos returns the newest todo tool call and its list.
+func (a *app) latestTodos() (string, []acpclient.PlanEntry, bool) {
+	for i := len(a.transcript) - 1; i >= 0; i-- {
+		e := &a.transcript[i]
+		if e.Kind == entryTool && e.TodoList {
+			return e.ToolID, e.Todos, true
+		}
+	}
+	return "", nil, false
 }
 
 // reload restarts the app and resumes the newest session.
@@ -214,44 +415,13 @@ func (a *app) confirmQuit() {
 	}()
 }
 
-// refreshBranch reads the workspace's Git branch for the status bar.
-func (a *app) refreshBranch() {
-	cwd := a.cwd
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		out, err := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD").Output()
-		branch := ""
-		if err == nil {
-			branch = strings.TrimSpace(string(out))
-			if branch == "HEAD" {
-				branch = ""
-			}
-		}
-		a.win.Update(func() { a.branch = branch })
-	}()
-}
-
-func (a *app) askPermission(p *acpclient.PermissionRequest) {
-	if a.permission != nil {
-		a.permission.Reply <- ""
-	}
-	a.permission = p
-	a.permissionOpen = true
-	title := p.Title
-	if title == "" {
-		title = "Permission required"
-	}
-	a.notify(appName, title)
-}
-
 // attachLimit keeps a chosen file from filling memory; ACP carries images
 // inline as base64.
 const attachLimit = 20 << 20
 
 // attachFile asks for a file to send with the next prompt.
 func (a *app) attachFile() {
-	if a.client == nil {
+	if a.core == nil {
 		return
 	}
 	go func() {
@@ -297,93 +467,6 @@ func (a *app) clearAttachment() {
 	a.attachName = ""
 }
 
-func (a *app) apply(e acpclient.Event) {
-	switch e.Kind {
-	case acpclient.EventUserText:
-		a.appendText(entryUser, e.Text)
-	case acpclient.EventText:
-		a.appendText(entryAgent, e.Text)
-	case acpclient.EventThought:
-		a.appendText(entryThought, e.Text)
-	case acpclient.EventToolCall:
-		status := e.Status
-		if status == "" {
-			status = toolPending
-		}
-		a.capturePlanPath(e.ToolKind, e.ToolInput)
-		a.transcript = append(a.transcript, entry{
-			Kind:       entryTool,
-			Text:       e.Title,
-			ToolID:     e.ToolCallID,
-			Status:     status,
-			ToolInput:  e.ToolInput,
-			ToolOutput: e.ToolOutput,
-			ToolKind:   e.ToolKind,
-			Todos:      parseTodos(e.ToolInput),
-			Started:    time.Now(),
-		})
-	case acpclient.EventToolCallUpdate:
-		a.updateToolCall(e)
-	case acpclient.EventPlan:
-		a.updatePlan(e.Plan)
-	case acpclient.EventConfig:
-		a.configSeen = true
-		a.models = e.Models
-		if e.Model != "" {
-			a.model = e.Model
-		}
-		a.syncMenu()
-	case acpclient.EventMode:
-		a.mode = e.Mode
-		a.syncMenu()
-	case acpclient.EventPermission:
-		a.askPermission(e.Permission)
-	case acpclient.EventElicitation:
-		a.startElicitation(e.Elicitation)
-	case acpclient.EventUsage:
-		a.contextUsed, a.contextSize = e.ContextUsed, e.ContextSize
-		a.costAmount, a.costCurrency = e.CostAmount, e.CostCurrency
-	case acpclient.EventPromptDone:
-		a.promptDone(e)
-	}
-}
-
-func (a *app) promptDone(e acpclient.Event) {
-	a.busy = false
-	a.status = ""
-	a.escAt = time.Time{}
-	if a.stopping || e.Err != nil {
-		restored := false
-		if a.prompt == "" && a.lastPrompt != "" {
-			a.prompt = a.lastPrompt
-			restored = true
-		}
-		switch {
-		case a.stopping && restored:
-			a.notice = "Stopped — prompt restored"
-		case a.stopping:
-			a.notice = "Stopped"
-		case restored:
-			a.notice = "Draft restored"
-		default:
-			a.notice = "Prompt failed"
-		}
-		a.stopping = false
-	} else {
-		a.notice = ""
-		a.notify(appName, "Turn finished.")
-		if a.mode == modePlan && a.planPath != "" {
-			if _, _, ok := a.matchCommand("/opsx:ff"); ok {
-				a.planReady = true
-			}
-		}
-	}
-	a.lastPrompt = ""
-	if e.Err != nil {
-		a.err = e.Err.Error()
-	}
-}
-
 // notify shows a desktop notification while the window is in the background,
 // so a permission request or a finished turn is not missed.
 func (a *app) notify(title, body string) {
@@ -393,78 +476,6 @@ func (a *app) notify(title, body string) {
 	go func() {
 		_ = mygo.NewNotification(mygo.NotificationOptions{Title: title, Body: body}).Show()
 	}()
-}
-
-func (a *app) appendText(kind entryKind, text string) {
-	if n := len(a.transcript); n > 0 && a.transcript[n-1].Kind == kind {
-		a.transcript[n-1].Text += text
-		return
-	}
-	a.transcript = append(a.transcript, entry{Kind: kind, Text: text})
-}
-
-func (a *app) updateToolCall(e acpclient.Event) {
-	for i := len(a.transcript) - 1; i >= 0; i-- {
-		if a.transcript[i].Kind != entryTool || a.transcript[i].ToolID != e.ToolCallID {
-			continue
-		}
-		if e.Title != "" {
-			a.transcript[i].Text = e.Title
-		}
-		if e.Status != "" {
-			a.transcript[i].Status = e.Status
-		}
-		if e.ToolInput != "" {
-			a.transcript[i].ToolInput = e.ToolInput
-			a.transcript[i].Todos = parseTodos(e.ToolInput)
-			a.capturePlanPath(a.transcript[i].ToolKind, e.ToolInput)
-		}
-		if e.ToolOutput != "" {
-			a.transcript[i].ToolOutput = e.ToolOutput
-		}
-		return
-	}
-}
-
-// capturePlanPath remembers the file Maki writes while plan mode is on. Plan
-// mode allows writes only to that file, so an edit call names the plan.
-func (a *app) capturePlanPath(kind, input string) {
-	if a.mode != modePlan || kind != toolKindEdit {
-		return
-	}
-	var in struct {
-		Path     string `json:"path"`
-		FilePath string `json:"file_path"`
-	}
-	if json.Unmarshal([]byte(input), &in) != nil {
-		return
-	}
-	path := in.Path
-	if path == "" {
-		path = in.FilePath
-	}
-	if path != "" {
-		a.planPath = path
-	}
-}
-
-// parseTodos reads a todo tool call's input, which is a JSON object with a
-// "todos" array. Other tool inputs return nil.
-func parseTodos(input string) []acpclient.PlanEntry {
-	var v struct {
-		Todos []struct {
-			Content string `json:"content"`
-			Status  string `json:"status"`
-		} `json:"todos"`
-	}
-	if json.Unmarshal([]byte(input), &v) != nil || len(v.Todos) == 0 {
-		return nil
-	}
-	todos := make([]acpclient.PlanEntry, len(v.Todos))
-	for i, t := range v.Todos {
-		todos[i] = acpclient.PlanEntry{Content: t.Content, Status: t.Status}
-	}
-	return todos
 }
 
 // runningTools returns the transcript indexes of tool calls still running.
@@ -478,105 +489,44 @@ func (a *app) runningTools() []int {
 	return idx
 }
 
-func (a *app) updatePlan(plan []acpclient.PlanEntry) {
-	a.plan = plan
-}
-
 func (a *app) startNewSession(cwd string) {
-	if a.client == nil {
+	if a.core == nil {
 		return
 	}
-	a.cwd = cwd
-	a.refreshBranch()
-	a.reset()
-	a.status = "Starting session…"
-	go func() {
-		s, err := a.client.NewSession(cwd)
-		a.win.Update(func() {
-			if err != nil {
-				a.status = ""
-				a.err = err.Error()
-				return
-			}
-			a.applySession(s)
-			a.status = ""
-		})
-	}()
+	go func() { _ = a.core.NewSession(cwd) }()
 }
 
 func (a *app) resumeLast() {
-	cwd := a.cwd
-	a.status = "Loading session…"
+	if a.core == nil {
+		return
+	}
 	go func() {
-		sessions, err := a.client.ListSessions(cwd)
-		a.win.Update(func() {
-			a.status = ""
-			if err != nil || len(sessions) == 0 {
-				a.startNewSession(cwd)
-				return
-			}
-			a.resume(sessions[0].ID)
-		})
+		sessions, err := a.core.ListSessions()
+		if err != nil || len(sessions) == 0 {
+			a.startNewSession(a.cwd)
+			return
+		}
+		a.resume(sessions[0].ID)
 	}()
 }
 
 func (a *app) resume(id string) {
-	if a.client == nil || a.resumeLoading {
+	if a.core == nil || a.resumeLoading {
 		return
 	}
-	cwd := a.cwd
-	a.reset()
-	a.status = "Loading session…"
 	a.resumeLoading = true
 	a.resumeErr = ""
 	go func() {
-		s, err := a.client.LoadSession(cwd, id)
+		err := a.core.LoadSession(id)
 		a.win.Update(func() {
 			a.resumeLoading = false
-			a.status = ""
 			if err != nil {
 				a.resumeErr = err.Error()
-				a.err = err.Error()
 				return
 			}
 			a.resumeOpen = false
-			a.resumed = true
-			a.applySession(s)
 		})
 	}()
-}
-
-func (a *app) reset() {
-	a.transcript = nil
-	a.plan = nil
-	a.planPath = ""
-	a.planReady = false
-	a.planExpanded = false
-	a.prompt = ""
-	a.busy = false
-	a.err = ""
-	a.notice = ""
-	a.lastPrompt = ""
-	a.stopping = false
-	a.escAt = time.Time{}
-	a.contextUsed, a.contextSize = 0, 0
-	a.costAmount, a.costCurrency = 0, ""
-	a.configSeen = false
-	a.resumed = false
-	a.sessionPick = -1
-	a.scroll = ui.ScrollState{}
-	a.clearAttachment()
-}
-
-func (a *app) applySession(s acpclient.Session) {
-	a.sessionID = s.ID
-	if !a.configSeen {
-		a.models = s.Models
-		a.model = s.Model
-	}
-	a.modes = s.Modes
-	a.mode = s.Mode
-	a.syncMenu()
 }
 
 func (a *app) pickDirectory() {
@@ -599,36 +549,22 @@ func (a *app) openSessions() {
 }
 
 func (a *app) loadSessions(open bool) {
-	if a.client == nil {
+	if a.core == nil {
 		return
 	}
-	cwd := a.cwd
 	a.sessionsLoading = true
-	if open {
-		a.status = "Loading sessions…"
-	}
 	go func() {
-		sessions, err := a.client.ListSessions(cwd)
+		_, err := a.core.ListSessions()
 		a.win.Update(func() {
 			a.sessionsLoading = false
-			if open {
-				a.status = ""
-			}
-			if err != nil {
-				a.err = err.Error()
-				return
-			}
-			filtered := make([]acpclient.SessionInfo, 0, len(sessions))
-			for _, s := range sessions {
-				if s.ID != a.sessionID {
-					filtered = append(filtered, s)
-				}
-			}
-			a.sessions = filtered
 			a.sessionsList = ui.ListState{}
 			a.sessionPick = -1
 			a.resumeLoading = false
 			a.resumeErr = ""
+			if err != nil {
+				a.err = err.Error()
+				return
+			}
 			if open {
 				a.resumeOpen = true
 			}
@@ -637,31 +573,21 @@ func (a *app) loadSessions(open bool) {
 }
 
 func (a *app) rewindLastTurn() {
-	idx := -1
-	for i := range slices.Backward(a.transcript) {
-		if a.transcript[i].Kind == entryUser {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+	if a.core == nil {
 		return
 	}
-	text := a.transcript[idx].Text
-	a.transcript = a.transcript[:idx]
-	a.prompt = text
-	a.lastPrompt = ""
-	a.err = ""
-	a.notice = "Last prompt restored"
+	if text, ok := a.core.RewindLastTurn(); ok {
+		a.prompt = text
+		a.notice = "Last prompt restored"
+	}
 }
 
 func (a *app) stopPrompt() {
-	if a.client == nil || !a.busy {
+	if a.core == nil {
 		return
 	}
-	a.stopping = true
 	a.notice = "Stopping…"
-	go func() { _ = a.client.Cancel() }()
+	a.core.Cancel()
 	if a.win != nil {
 		a.win.Invalidate()
 	}
@@ -674,7 +600,12 @@ func (a *app) send(text string) bool {
 		a.reload()
 		return true
 	}
-	if text == "" || a.busy || a.client == nil {
+	if text == "/new" {
+		a.prompt = ""
+		a.startNewSession(a.cwd)
+		return true
+	}
+	if text == "" || a.core == nil {
 		return false
 	}
 	att := a.attach
@@ -682,30 +613,10 @@ func (a *app) send(text string) bool {
 	if a.attachName != "" {
 		display += "\n\n[" + a.attachName + "]"
 	}
-	return a.sendPrompt(a.expandedPrompt(text), display, att)
-}
-
-// sendPrompt starts a turn with an already-expanded prompt and a short line
-// for the transcript.
-func (a *app) sendPrompt(prompt, display string, att *acpclient.Attachment) bool {
-	a.prompt = ""
-	a.err = ""
-	a.notice = ""
-	a.lastPrompt = display
-	a.escAt = time.Time{}
-	a.planReady = false
-	mark := len(a.transcript)
-	a.transcript = append(a.transcript, entry{Kind: entryUser, Text: display})
-	a.busy = true
-	a.status = "Working…"
-	if a.sessionID == "" {
-		a.startSessionAndPrompt(prompt, display, att, mark)
-		return true
-	}
-	if err := a.client.Prompt(prompt, att); err != nil {
-		a.failSend(display, mark, err)
+	if !a.core.Send(a.expandedPrompt(text), display, att) {
 		return false
 	}
+	a.prompt = ""
 	a.clearAttachment()
 	return true
 }
@@ -715,28 +626,16 @@ func (a *app) sendPrompt(prompt, display string, att *acpclient.Attachment) bool
 func (a *app) sendPlanChange() {
 	path := a.planPath
 	cmd, _, ok := a.matchCommand("/opsx:ff")
-	if !ok || path == "" || a.busy || a.client == nil {
+	if !ok || path == "" || a.busy || a.core == nil {
 		return
 	}
 	prompt := planChangePrompt(cmd, path)
-	a.planPath = ""
 	a.planReady = false
-	prev := a.mode
-	a.mode = "build"
-	a.syncMenu()
-	a.win.Invalidate()
 	go func() {
-		if err := a.client.SetMode("build"); err != nil {
-			a.win.Update(func() {
-				a.mode = prev
-				a.planPath = path
-				a.planReady = true
-				a.err = err.Error()
-				a.syncMenu()
-			})
+		if err := a.core.SetMode("build"); err != nil {
 			return
 		}
-		a.win.Update(func() { a.sendPrompt(prompt, "/opsx:ff (from plan)", nil) })
+		a.core.Send(prompt, "/opsx:ff (from plan)", nil)
 	}()
 }
 
@@ -747,63 +646,13 @@ func planChangePrompt(cmd customCommand, path string) string {
 		"Do not re-litigate the plan's decisions: generate the artifacts from it."
 }
 
-func (a *app) startSessionAndPrompt(prompt, display string, att *acpclient.Attachment, mark int) {
-	cwd := a.cwd
-	go func() {
-		s, err := a.client.NewSession(cwd)
-		a.win.Update(func() {
-			if err != nil {
-				a.failSend(display, mark, err)
-				return
-			}
-			a.applySession(s)
-			if a.stopping {
-				a.abortSend(display, mark)
-				return
-			}
-			if err := a.client.Prompt(prompt, att); err != nil {
-				a.failSend(display, mark, err)
-				return
-			}
-			a.clearAttachment()
-		})
-	}()
-}
-
-func (a *app) failSend(text string, mark int, err error) {
-	a.transcript = a.transcript[:min(mark, len(a.transcript))]
-	a.busy = false
-	a.status = ""
-	a.err = err.Error()
-	a.notice = "Draft restored"
-	a.prompt = text
-	a.lastPrompt = ""
-}
-
-func (a *app) abortSend(text string, mark int) {
-	a.transcript = a.transcript[:min(mark, len(a.transcript))]
-	a.busy = false
-	a.status = ""
-	a.stopping = false
-	a.notice = "Stopped — prompt restored"
-	a.prompt = text
-	a.lastPrompt = ""
-}
-
 func (a *app) switchModel(model string) {
-	prev := a.model
-	a.model = model
+	if a.core == nil {
+		return
+	}
+	go func() { _ = a.core.SetModel(model) }()
 	a.syncMenu()
 	a.win.Invalidate()
-	go func() {
-		if err := a.client.SetModel(model); err != nil {
-			a.win.Update(func() {
-				a.model = prev
-				a.err = err.Error()
-				a.syncMenu()
-			})
-		}
-	}()
 }
 
 // nextMode returns the mode after the current one, or "" when there is
@@ -816,38 +665,22 @@ func (a *app) nextMode() string {
 }
 
 func (a *app) switchMode(mode string) {
-	prev := a.mode
-	a.mode = mode
-	if mode != modePlan {
-		a.planPath = ""
-		a.planReady = false
+	if a.core == nil {
+		return
 	}
+	go func() { _ = a.core.SetMode(mode) }()
 	a.syncMenu()
 	a.win.Invalidate()
-	go func() {
-		if err := a.client.SetMode(mode); err != nil {
-			a.win.Update(func() {
-				a.mode = prev
-				a.err = err.Error()
-				a.syncMenu()
-			})
-		}
-	}()
 }
 
 func (a *app) answerPermission(option string) {
-	req := a.permission
-	a.permission = nil
 	a.permissionOpen = false
-	if req != nil {
-		req.Reply <- option
+	if a.core != nil {
+		a.core.AnswerPermission(option)
 	}
 }
 
 func (a *app) startElicitation(req *acpclient.ElicitationRequest) {
-	if a.elicitation != nil {
-		a.elicitation.Reply <- acpclient.ElicitationReply{Decline: true}
-	}
 	a.elicitation = req
 	a.elicitationOpen = true
 	a.answers = make(map[string]string)
@@ -861,16 +694,15 @@ func (a *app) startElicitation(req *acpclient.ElicitationRequest) {
 
 func (a *app) answerElicitation(decline bool) {
 	req := a.elicitation
-	a.elicitation = nil
 	a.elicitationOpen = false
-	if req == nil {
+	if req == nil || a.core == nil {
 		return
 	}
 	if decline {
-		req.Reply <- acpclient.ElicitationReply{Decline: true}
+		a.core.AnswerElicitation(nil, true)
 		return
 	}
-	req.Reply <- acpclient.ElicitationReply{Answers: a.elicitationAnswers(req)}
+	a.core.AnswerElicitation(a.elicitationAnswers(req), false)
 }
 
 func (a *app) elicitationAnswers(req *acpclient.ElicitationRequest) map[string]any {
@@ -910,4 +742,15 @@ func (a *app) singleValue(f acpclient.ElicitationField) (string, bool) {
 		}
 	}
 	return label, true
+}
+
+// popQueue pulls the first queued prompt back into the composer.
+func (a *app) popQueue() {
+	if a.core == nil {
+		return
+	}
+	if text, ok := a.core.PopQueue(); ok {
+		a.prompt = text
+		a.focusInput = true
+	}
 }

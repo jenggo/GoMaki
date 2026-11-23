@@ -46,14 +46,14 @@ func TestDiscoverOpsxSkills(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	config := filepath.Join(dir, "config")
-	skills := filepath.Join(config, "maki", ".agents", "skills")
+	home := filepath.Join(dir, "home")
+	skills := filepath.Join(home, ".agents", "skills")
 	writeCommand(t, filepath.Join(skills, "openspec-propose", "SKILL.md"),
 		"---\nname: openspec-propose\ndescription: Propose a change\n---\nPropose body.\n")
 	writeCommand(t, filepath.Join(skills, "openspec-ff-change", "SKILL.md"),
 		"---\nname: openspec-ff-change\ndescription: Fast forward\n---\nFF body with $ARGUMENTS.\n")
 
-	cmds := discoverCommandsIn(dir, "", config)
+	cmds := discoverCommandsIn(dir, home, "")
 	if len(cmds) != 2 {
 		t.Fatalf("commands = %+v", cmds)
 	}
@@ -99,7 +99,7 @@ func TestProjectCommandOverridesUser(t *testing.T) {
 
 func TestCommandPalette(t *testing.T) {
 	a := newTestApp()
-	a.client = &acpclient.Client{}
+	a.connected = true
 	a.cwd = "/test"
 	a.commandsCwd = "/test"
 	a.commands = []customCommand{{Name: "/project:foo", Description: "Foo command"}}
@@ -131,5 +131,18 @@ func TestExpandedPrompt(t *testing.T) {
 	}
 	if got := a.expandedPrompt("plain text"); got != "plain text" {
 		t.Fatalf("plain = %q", got)
+	}
+}
+
+func TestAcpCommandsInPalette(t *testing.T) {
+	a := newTestApp()
+	a.prompt = "/comp"
+	a.acpCommands = []acpclient.Command{{Name: "compact", Description: "Summarize history"}}
+	matches := a.commandMatches()
+	if len(matches) != 1 || matches[0].Name != "/compact" {
+		t.Fatalf("matches = %+v", matches)
+	}
+	if got := a.expandedPrompt("/compact some guidance"); got != "/compact some guidance" {
+		t.Fatalf("acp command must pass through raw, got %q", got)
 	}
 }

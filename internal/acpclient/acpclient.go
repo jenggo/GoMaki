@@ -33,6 +33,7 @@ const (
 	EventPermission
 	EventElicitation
 	EventUsage
+	EventCommands
 	EventPromptDone
 )
 
@@ -57,8 +58,9 @@ type Event struct {
 	StopReason   string
 	Plan         []PlanEntry
 	Models       []string
-	ContextUsed  int
-	ContextSize  int
+	Commands     []Command
+	ContextUsed  int64
+	ContextSize  int64
 	CostAmount   float64
 	Kind         EventKind
 }
@@ -67,6 +69,12 @@ type Event struct {
 type PlanEntry struct {
 	Content string
 	Status  string
+}
+
+// Command is a slash command the agent advertised over ACP.
+type Command struct {
+	Name        string
+	Description string
 }
 
 // PermissionRequest asks the user to choose one of the agent's options. An
@@ -154,9 +162,10 @@ type Client struct {
 	imageSupport bool
 }
 
-// Start spawns and initializes the agent process.
-func Start() (*Client, error) {
+// Start spawns and initializes the agent process in dir.
+func Start(dir string) (*Client, error) {
 	cmd := exec.CommandContext(context.Background(), "maki", "--trust", "acp")
+	cmd.Dir = dir
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -298,7 +307,7 @@ func (c *Client) attachmentBlock(att *Attachment) acp.ContentBlock {
 	}
 	link := acp.ResourceLinkBlock(filepath.Base(att.Path), (&url.URL{Scheme: "file", Path: att.Path}).String())
 	link.ResourceLink.MimeType = &att.MimeType
-	size := len(att.Data)
+	size := int64(len(att.Data))
 	link.ResourceLink.Size = &size
 	return link
 }
@@ -362,8 +371,8 @@ func renderValue(v any) string {
 	if v == nil {
 		return ""
 	}
-	if s, ok := v.(string); ok {
-		return s
+	if raw, ok := v.(json.RawMessage); ok && len(raw) == 0 {
+		return ""
 	}
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -384,6 +393,31 @@ func modelOptions(opts []acp.SessionConfigOption) ([]string, string, acp.Session
 		return collectModels(sel.Options), string(sel.CurrentValue), sel.Id
 	}
 	return nil, "", modelConfigID
+}
+
+func toolCallUpdateEvent(u *acp.SessionToolCallUpdate) Event {
+	e := Event{Kind: EventToolCallUpdate, ToolCallID: string(u.ToolCallId)}
+	if title, ok := u.Title.Value(); ok {
+		e.Title = title
+	}
+	if status, ok := u.Status.Value(); ok {
+		e.Status = string(status)
+	}
+	if raw, ok := u.RawInput.Value(); ok {
+		e.ToolInput = renderValue(raw)
+	}
+	if raw, ok := u.RawOutput.Value(); ok {
+		e.ToolOutput = renderValue(raw)
+	}
+	return e
+}
+
+func commandList(list []acp.AvailableCommand) []Command {
+	commands := make([]Command, 0, len(list))
+	for _, cmd := range list {
+		commands = append(commands, Command{Name: cmd.Name, Description: cmd.Description})
+	}
+	return commands
 }
 
 func collectModels(options acp.SessionConfigSelectOptions) []string {
@@ -430,16 +464,7 @@ func (c *Client) SessionUpdate(_ context.Context, n acp.SessionNotification) err
 			ToolOutput: renderValue(u.ToolCall.RawOutput),
 		})
 	case u.ToolCallUpdate != nil:
-		e := Event{Kind: EventToolCallUpdate, ToolCallID: string(u.ToolCallUpdate.ToolCallId)}
-		if u.ToolCallUpdate.Title != nil {
-			e.Title = *u.ToolCallUpdate.Title
-		}
-		if u.ToolCallUpdate.Status != nil {
-			e.Status = string(*u.ToolCallUpdate.Status)
-		}
-		e.ToolInput = renderValue(u.ToolCallUpdate.RawInput)
-		e.ToolOutput = renderValue(u.ToolCallUpdate.RawOutput)
-		c.emit(e)
+		c.emit(toolCallUpdateEvent(u.ToolCallUpdate))
 	case u.Plan != nil:
 		entries := make([]PlanEntry, 0, len(u.Plan.Entries))
 		for _, p := range u.Plan.Entries {
@@ -453,6 +478,8 @@ func (c *Client) SessionUpdate(_ context.Context, n acp.SessionNotification) err
 		}
 	case u.CurrentModeUpdate != nil:
 		c.emit(Event{Kind: EventMode, Mode: string(u.CurrentModeUpdate.CurrentModeId)})
+	case u.AvailableCommandsUpdate != nil:
+		c.emit(Event{Kind: EventCommands, Commands: commandList(u.AvailableCommandsUpdate.AvailableCommands)})
 	case u.UsageUpdate != nil:
 		e := Event{Kind: EventUsage, ContextUsed: u.UsageUpdate.Used, ContextSize: u.UsageUpdate.Size}
 		if u.UsageUpdate.Cost != nil {
@@ -470,8 +497,8 @@ func (c *Client) RequestPermission(ctx context.Context, p acp.RequestPermissionR
 	req := &PermissionRequest{
 		Reply: make(chan string, 1),
 	}
-	if p.ToolCall.Title != nil {
-		req.Title = *p.ToolCall.Title
+	if title, ok := p.ToolCall.Title.Value(); ok {
+		req.Title = title
 	}
 	for _, o := range p.Options {
 		req.Options = append(req.Options, PermissionOption{
@@ -503,9 +530,9 @@ func cancelledPermission() acp.RequestPermissionResponse {
 	}
 }
 
-// UnstableCreateElicitation implements the SDK's elicitation extension. Only
-// form elicitations are rendered; URL elicitations are declined.
-func (c *Client) UnstableCreateElicitation(ctx context.Context, p acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
+// CreateElicitation implements acp.Client. Only form elicitations are
+// rendered; URL elicitations are declined.
+func (c *Client) CreateElicitation(ctx context.Context, p acp.CreateElicitationRequest) (acp.CreateElicitationResponse, error) {
 	if p.Form == nil {
 		return declinedElicitation(), nil
 	}
@@ -521,21 +548,43 @@ func (c *Client) UnstableCreateElicitation(ctx context.Context, p acp.UnstableCr
 		if reply.Decline {
 			return declinedElicitation(), nil
 		}
-		return acp.UnstableCreateElicitationResponse{
-			Accept: &acp.UnstableCreateElicitationAccept{Action: "accept", Content: reply.Answers},
+		return acp.CreateElicitationResponse{
+			Accept: &acp.CreateElicitationAccept{Action: "accept", Content: elicitationContent(reply.Answers)},
 		}, nil
 	case <-ctx.Done():
 		return declinedElicitation(), nil
 	}
 }
 
-func declinedElicitation() acp.UnstableCreateElicitationResponse {
-	return acp.UnstableCreateElicitationResponse{
-		Decline: &acp.UnstableCreateElicitationDecline{Action: "decline"},
+// CompleteElicitation implements acp.Client. URL elicitations are declined,
+// so there is nothing to complete.
+func (c *Client) CompleteElicitation(context.Context, acp.CompleteElicitationNotification) error {
+	return nil
+}
+
+func elicitationContent(answers map[string]any) map[string]acp.ElicitationContentValue {
+	if len(answers) == 0 {
+		return nil
+	}
+	content := make(map[string]acp.ElicitationContentValue, len(answers))
+	for name, answer := range answers {
+		switch v := answer.(type) {
+		case string:
+			content[name] = acp.NewElicitationContentValueString(v)
+		case []string:
+			content[name] = acp.NewElicitationContentValueStringArray(v...)
+		}
+	}
+	return content
+}
+
+func declinedElicitation() acp.CreateElicitationResponse {
+	return acp.CreateElicitationResponse{
+		Decline: &acp.CreateElicitationDecline{Action: "decline"},
 	}
 }
 
-func parseFields(props map[string]any) []ElicitationField {
+func parseFields(props map[string]acp.ElicitationPropertySchema) []ElicitationField {
 	keys := make([]string, 0, len(props))
 	for k := range props {
 		keys = append(keys, k)
@@ -544,18 +593,27 @@ func parseFields(props map[string]any) []ElicitationField {
 
 	fields := make([]ElicitationField, 0, len(keys))
 	for _, k := range keys {
-		prop, ok := props[k].(map[string]any)
-		if !ok {
-			continue
-		}
+		prop := props[k]
 		f := ElicitationField{Name: k}
-		f.Title, _ = prop["title"].(string)
-		f.Description, _ = prop["description"].(string)
-		if prop["type"] == "array" {
+		switch {
+		case prop.String != nil:
+			f.Title = stringValue(prop.String.Title)
+			f.Description = stringValue(prop.String.Description)
+			f.Options = enumOptions(prop.String.Enum, prop.String.OneOf)
+		case prop.Number != nil:
+			f.Title = stringValue(prop.Number.Title)
+			f.Description = stringValue(prop.Number.Description)
+		case prop.Integer != nil:
+			f.Title = stringValue(prop.Integer.Title)
+			f.Description = stringValue(prop.Integer.Description)
+		case prop.Boolean != nil:
+			f.Title = stringValue(prop.Boolean.Title)
+			f.Description = stringValue(prop.Boolean.Description)
+		case prop.Array != nil:
+			f.Title = stringValue(prop.Array.Title)
+			f.Description = stringValue(prop.Array.Description)
 			f.Multi = true
-			f.Options = enumOptions(prop["items"])
-		} else {
-			f.Options = enumOptions(prop)
+			f.Options = itemOptions(prop.Array.Items)
 		}
 		if f.Title == "" {
 			f.Title = k
@@ -563,6 +621,13 @@ func parseFields(props map[string]any) []ElicitationField {
 		fields = append(fields, f)
 	}
 	return fields
+}
+
+func stringValue(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func fieldKeyLess(a, b string) bool {
@@ -574,49 +639,30 @@ func fieldKeyLess(a, b string) bool {
 	return a < b
 }
 
-func enumOptions(v any) []ElicitationOption {
-	switch x := v.(type) {
-	case map[string]any:
-		for _, key := range []string{"oneOf", "anyOf", "options"} {
-			if list, ok := x[key].([]any); ok {
-				return optionList(list)
-			}
-		}
-		if list, ok := x["enum"].([]any); ok {
-			return optionList(list)
-		}
-		if items, ok := x["items"].(map[string]any); ok {
-			return enumOptions(items)
-		}
-	case []any:
-		return optionList(x)
+func itemOptions(items acp.MultiSelectItems) []ElicitationOption {
+	switch {
+	case items.String != nil:
+		return enumOptions(items.String.Enum, nil)
+	case items.Titled != nil:
+		return enumOptions(nil, items.Titled.AnyOf)
 	}
 	return nil
 }
 
-func optionList(list []any) []ElicitationOption {
-	var out []ElicitationOption
-	for _, item := range list {
-		switch v := item.(type) {
-		case string:
-			out = append(out, ElicitationOption{Value: v, Label: v})
-		case map[string]any:
-			value := ""
-			for _, key := range []string{"const", "value", "label"} {
-				if s, ok := v[key].(string); ok {
-					value = s
-					break
-				}
-			}
-			if value == "" {
-				continue
-			}
-			label := value
-			if title, ok := v["title"].(string); ok && title != "" {
-				label = title
-			}
-			out = append(out, ElicitationOption{Value: value, Label: label})
+func enumOptions(enum []string, oneOf []acp.EnumOption) []ElicitationOption {
+	if len(oneOf) > 0 {
+		out := make([]ElicitationOption, 0, len(oneOf))
+		for _, o := range oneOf {
+			out = append(out, ElicitationOption{Value: o.Const, Label: o.Title})
 		}
+		return out
+	}
+	if len(enum) == 0 {
+		return nil
+	}
+	out := make([]ElicitationOption, 0, len(enum))
+	for _, v := range enum {
+		out = append(out, ElicitationOption{Value: v, Label: v})
 	}
 	return out
 }

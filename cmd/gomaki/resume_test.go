@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"gomaki/internal/acpclient"
+	"gomaki/internal/session"
 )
 
 // TestResumeReplaysIntoTranscript loads a stored session through the real
-// agent and checks the replayed events reach the app's transcript. It needs
+// agent and checks the replayed events reach the core transcript. It needs
 // MAKI_ACP_TEST=1 and a stored session in this project.
 func TestResumeReplaysIntoTranscript(t *testing.T) {
 	if os.Getenv("MAKI_ACP_TEST") == "" {
@@ -21,36 +21,31 @@ func TestResumeReplaysIntoTranscript(t *testing.T) {
 		t.Skip("maki is not on PATH")
 	}
 
-	c, err := acpclient.Start()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-
 	cwd, err := filepath.Abs("../..")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := c.ListSessions(cwd)
+	core := session.New()
+	if err := core.Start(cwd); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = core.Close() })
+
+	sessions, err := core.ListSessions()
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	for _, s := range sessions {
-		if _, err := c.LoadSession(cwd, s.ID); err != nil {
+		if err := core.LoadSession(s.ID); err != nil {
 			continue
 		}
-		a := newTestApp()
-		a.events = c.Events()
 		deadline := time.After(5 * time.Second)
 		for {
 			select {
-			case e := <-c.Events():
-				a.apply(e)
 			case <-deadline:
 				t.Fatal("replayed session left the transcript empty")
 			default:
-				if len(a.transcript) > 0 {
+				if len(core.Snapshot().Transcript) > 0 {
 					return
 				}
 				time.Sleep(5 * time.Millisecond)

@@ -16,7 +16,8 @@ import (
 )
 
 func (a *app) view(c *ui.Context) {
-	a.drain()
+	a.mirror()
+	a.syncTodo()
 	if a.commandsCwd != a.cwd {
 		a.loadCommands()
 	}
@@ -26,11 +27,19 @@ func (a *app) view(c *ui.Context) {
 		c.WriteClipboard(a.copyPending)
 		a.copyPending = ""
 	}
+	if a.toastPending != "" {
+		c.Toast(a.toastPending)
+		a.toastPending = ""
+	}
 	if c.Shortcut(ui.Cmd, ui.KeyC) {
 		a.copyOrClear(c)
 	}
 	if len(a.runningTools()) > 0 && c.Shortcut(ui.Cmd|ui.Shift, ui.KeyB) {
 		a.runningOpen = !a.runningOpen
+	}
+	if a.httpMode {
+		a.httpPlaceholder(c, t)
+		return
 	}
 	var col ui.Element
 	ui.Column(c).Fill().Background(t.Background).Children(func() {
@@ -42,6 +51,7 @@ func (a *app) view(c *ui.Context) {
 		} else {
 			col = a.transcriptView(c, t)
 		}
+		a.todoPanel(c, t)
 		a.planPanel(c, t)
 		a.planAction(c, t)
 		a.composer(c, t)
@@ -141,9 +151,9 @@ func (a *app) statusValues(t *ui.Theme) (workspace, model, mode, status string, 
 	status = a.status
 	if status == "" {
 		switch {
-		case a.client == nil && a.err != "":
+		case !a.connected && a.err != "":
 			status = "Maki unavailable"
-		case a.client == nil:
+		case !a.connected:
 			status = "Connecting…"
 		case a.sessionID == "":
 			status = "No session"
@@ -159,7 +169,7 @@ func (a *app) statusValues(t *ui.Theme) (workspace, model, mode, status string, 
 		status = a.notice
 		color = t.Success
 	}
-	if a.client == nil && a.err != "" {
+	if !a.connected && a.err != "" {
 		color = t.Danger
 	}
 	return workspace, model, mode, status, color
@@ -205,13 +215,13 @@ func (a *app) statusIconOnly() bool {
 	if a.busy {
 		return true
 	}
-	return a.client != nil && a.sessionID != "" && a.status == ""
+	return a.connected && a.sessionID != "" && a.status == ""
 }
 
 func (a *app) errorBanner(c *ui.Context, t *ui.Theme) {
 	ui.Row(c).Padding(t.Space(2), t.Space(4)).Gap(t.Space(2)).AlignItems(ui.Center).Background(ui.RGBA(180, 40, 40, 0.16)).Children(func() {
 		ui.Text(c, a.err).TextColor(t.Danger).Grow(1)
-		if a.client == nil {
+		if !a.connected {
 			if ui.Button(c, "Retry").Clicked() {
 				a.err = ""
 				a.startup()
@@ -226,7 +236,7 @@ func (a *app) emptyState(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Grow(1).Center().Gap(t.Space(2)).Children(func() {
 		ui.Text(c, appName).FontSize(t.Rem(1.6)).Bold()
 		ui.Text(c, "A desktop client for Maki's ACP.").TextColor(t.TextMuted)
-		if a.client == nil {
+		if !a.connected {
 			if a.err == "" {
 				ui.Row(c).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
 					ui.Spinner(c).Size(16, 16)
@@ -335,18 +345,17 @@ func (a *app) entryView(c *ui.Context, col ui.Element, e *entry, t *ui.Theme, st
 
 func (a *app) toolEntry(c *ui.Context, col ui.Element, e *entry, t *ui.Theme) {
 	todos := len(e.Todos) > 0
-	expandable := !todos && (e.ToolInput != "" || e.ToolOutput != "")
+	expandable := todos || e.ToolInput != "" || e.ToolOutput != ""
 	ui.Column(c).Gap(t.Space(1)).Padding(t.Space(2), t.Space(2.5)).Radius(t.Space(2)).Background(t.Surface).Border(1, t.Border).Children(func() {
 		a.toolHeader(c, col, e, t, expandable)
-		if todos {
-			ui.Divider(c)
-			a.todoList(c, e.Todos, t)
-			return
-		}
 		if !e.Expanded {
 			return
 		}
 		ui.Divider(c)
+		if todos {
+			a.todoList(c, e.Todos, t)
+			return
+		}
 		if e.ToolInput != "" {
 			a.toolBlock(c, col, "Input", e.ToolInput, t)
 		}
@@ -369,7 +378,10 @@ func (a *app) toolHeader(c *ui.Context, col ui.Element, e *entry, t *ui.Theme, e
 		if expandable {
 			ui.Text(c, chevron(e.Expanded)).FontSize(t.Rem(0.8)).TextColor(t.TextMuted).IgnoreInput(true)
 		}
-		title := ui.Text(c, e.Text).Bold().FontSize(t.Rem(0.9))
+		if label := kindLabel(e.ToolName, e.Text); label != "" {
+			ui.Text(c, label).FontSize(t.Rem(0.7)).TextColor(t.TextMuted).IgnoreInput(true)
+		}
+		title := ui.Text(c, e.Text).Bold().FontSize(t.Rem(0.9)).Grow(1).MaxLines(1)
 		badge := ui.Badge(c, statusLabel(e.Status)).Background(statusColor(t, e.Status)).
 			TextColor(statusTextColor(t, e.Status))
 		if expandable {
@@ -467,7 +479,7 @@ func thoughtPreview(text string) string {
 	return text
 }
 
-func tokenCount(n int) string {
+func tokenCount(n int64) string {
 	switch {
 	case n >= 1_000_000:
 		v := float64(n) / 1_000_000
@@ -500,7 +512,7 @@ func (a *app) toolBlock(c *ui.Context, col ui.Element, label, text string, t *ui
 			a.copyable(c, col, ui.Text(c, text).FontSize(t.Rem(0.8)))
 			return
 		}
-		markdown.View(c, codeFence(text), &a.md)
+		markdown.View(c, codeFence(text), &a.toolMD)
 	})
 }
 
@@ -559,6 +571,15 @@ const (
 	toolKindEdit  = "edit"
 	modePlan      = "plan"
 )
+
+// kindLabel is the muted tool name shown before the title. It is empty when
+// the title already carries it, so "read" never prints twice.
+func kindLabel(name, title string) string {
+	if strings.EqualFold(name, title) {
+		return ""
+	}
+	return name
+}
 
 func statusLabel(status string) string {
 	switch status {
@@ -632,31 +653,89 @@ func (a *app) commandPalette(c *ui.Context, t *ui.Theme) {
 	if len(cmds) == 0 {
 		return
 	}
+	if a.paletteIndex >= len(cmds) {
+		a.paletteIndex = len(cmds) - 1
+	}
+	if a.paletteIndex < 0 {
+		a.paletteIndex = 0
+	}
+	a.paletteList.Key = func(i int) any { return cmds[i].Name }
+	a.paletteList.Label = func(i int) string { return cmds[i].Name }
+	a.paletteList.ScrollIntoView(a.paletteIndex)
 	ui.Column(c).Padding(t.Space(2), t.Space(3)).Gap(t.Space(0.5)).Background(t.Surface).BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Children(func() {
 		ui.Text(c, "Commands").FontSize(t.Rem(0.75)).Bold().TextColor(t.TextMuted)
-		ui.Scroll(c).MaxHeight(t.Rem(16)).Children(func() {
-			ui.Column(c).Children(func() {
-				for _, cmd := range cmds {
-					row := ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).
-						Padding(t.Space(1.5), t.Space(2)).Radius(t.Space(1)).
-						Cursor(ui.CursorPointer)
-					if row.Hovered() {
-						row = row.Background(t.SurfaceHover)
-					}
-					row.OnClick(func() {
-						a.prompt = cmd.Name + " "
-						a.focusInput = true
-					})
-					row.Children(func() {
-						ui.Text(c, cmd.Name).Bold().FontSize(t.Rem(0.85))
-						if cmd.Description != "" {
-							ui.Text(c, cmd.Description).FontSize(t.Rem(0.8)).
-								TextColor(t.TextMuted).Grow(1)
-						}
-					})
+		ui.List(c, &a.paletteList, len(cmds), func(i int) {
+			cmd := cmds[i]
+			row := ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Padding(t.Space(1.5), t.Space(2)).Radius(t.Space(1)).
+				Cursor(ui.CursorPointer)
+			if i == a.paletteIndex {
+				row = row.Background(t.SurfaceHover)
+			}
+			row.OnClick(func() {
+				a.paletteIndex = i
+				a.prompt = cmd.Name + " "
+				a.focusInput = true
+			})
+			row.Children(func() {
+				ui.Text(c, cmd.Name).Bold().FontSize(t.Rem(0.85))
+				if cmd.Description != "" {
+					ui.Text(c, cmd.Description).FontSize(t.Rem(0.8)).TextColor(t.TextMuted).Grow(1)
 				}
 			})
+		}).MaxHeight(t.Rem(16))
+	})
+}
+
+// todoPanel pins the newest todo tool list above the composer. It stays until
+// a new list replaces it or the user closes it once every item is done.
+func (a *app) todoPanel(c *ui.Context, t *ui.Theme) {
+	id, todos, ok := a.latestTodos()
+	if !ok || len(todos) == 0 || id == a.todoDismissed {
+		return
+	}
+	done := 0
+	current := ""
+	for _, p := range todos {
+		switch p.Status {
+		case toolCompleted, "cancelled":
+			done++
+		case toolRunning:
+			if current == "" {
+				current = p.Content
+			}
+		}
+	}
+	allDone := done == len(todos)
+	ui.Column(c).Padding(t.Space(1), t.Space(3)).Gap(t.Space(1)).BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Children(func() {
+		ui.Row(c).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+			header := ui.Row(c).Gap(t.Space(1.5)).AlignItems(ui.Center).Cursor(ui.CursorPointer).Grow(1)
+			header.OnClick(func() { a.todoExpanded = !a.todoExpanded })
+			header.Children(func() {
+				ui.Text(c, chevron(a.todoExpanded)).FontSize(t.Rem(0.75)).TextColor(t.TextMuted).IgnoreInput(true)
+				ui.Text(c, fmt.Sprintf("Tasks %d of %d", done, len(todos))).
+					FontSize(t.Rem(0.75)).Bold().TextColor(t.TextMuted).IgnoreInput(true)
+				if current != "" {
+					ui.Text(c, "·").FontSize(t.Rem(0.75)).TextColor(t.TextMuted).IgnoreInput(true)
+					ui.Text(c, current).FontSize(t.Rem(0.75)).TextColor(t.TextMuted).
+						Grow(1).MaxLines(1).IgnoreInput(true)
+				}
+			})
+			if allDone {
+				ui.Text(c, "×").FontSize(t.Rem(0.9)).TextColor(t.TextMuted).
+					Cursor(ui.CursorPointer).Padding(t.Space(0.5), t.Space(1)).
+					OnClick(func() { a.todoDismissed = id })
+			}
 		})
+		if !a.todoExpanded {
+			return
+		}
+		for _, p := range todos {
+			ui.Row(c).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, planIcon(p.Status)).FontSize(t.Rem(0.75)).TextColor(planColor(t, p.Status)).IgnoreInput(true)
+				ui.Text(c, p.Content).FontSize(t.Rem(0.8)).TextColor(planTextColor(t, p.Status)).
+					Grow(1).MaxLines(2).IgnoreInput(true)
+			})
+		}
 	})
 }
 
@@ -710,6 +789,9 @@ func (a *app) planAction(c *ui.Context, t *ui.Theme) {
 	if !a.planReady {
 		return
 	}
+	if _, _, ok := a.matchCommand("/opsx:ff"); !ok {
+		return
+	}
 	ui.Row(c).Padding(t.Space(1), t.Space(3)).Gap(t.Space(2)).AlignItems(ui.Center).
 		BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Children(func() {
 		ui.Text(c, "Plan ready").FontSize(t.Rem(0.75)).Bold().TextColor(t.TextMuted).IgnoreInput(true)
@@ -756,6 +838,7 @@ func planTextColor(t *ui.Theme, status string) ui.Color {
 func (a *app) composer(c *ui.Context, t *ui.Theme) {
 	a.commandPalette(c, t)
 	ui.Column(c).BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Children(func() {
+		a.queuePanel(c, t)
 		if a.attachName != "" {
 			ui.Row(c).Padding(t.Space(1), t.Space(3)).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "Attached: "+a.attachName).FontSize(t.Rem(0.75)).TextColor(t.TextMuted).Grow(1).MaxLines(1)
@@ -767,7 +850,7 @@ func (a *app) composer(c *ui.Context, t *ui.Theme) {
 		ui.Row(c).Padding(t.Space(1.5), t.Space(3)).Gap(t.Space(2)).AlignItems(ui.End).Children(func() {
 			input := ui.TextAreaBase(c, &a.prompt).Lines(1, 7).Grow(1).AutoFocus().
 				Padding(t.Space(1), t.Space(2)).Radius(t.Space(2)).
-				Background(t.Surface).Border(1, t.Border).Disabled(a.client == nil).
+				Background(t.Surface).Border(1, t.Border).Disabled(!a.connected).
 				HandleInput(func(ev ui.InputEvent) bool {
 					// The Edit menu's Copy reaches the focused field, so take it
 					// here while the transcript holds the selection.
@@ -784,13 +867,26 @@ func (a *app) composer(c *ui.Context, t *ui.Theme) {
 				a.focusInput = false
 				input.Focus()
 			}
-			input.Placeholder("Ask Maki… (Enter to send, Shift+Enter for a newline)").
+			input.Placeholder("Ask Maki… (Enter to send, Shift+Enter for a newline, Ctrl+Q to pull a queued prompt)").
 				OnTextKey(func(k ui.TextKey) bool { return a.composerKey(c, k) })
 		})
 	})
 }
 
 // composerKey handles the keys the composer takes before the text area does.
+func (a *app) queuePanel(c *ui.Context, t *ui.Theme) {
+	if len(a.queue) == 0 {
+		return
+	}
+	ui.Column(c).Padding(t.Space(1), t.Space(3)).Gap(t.Space(0.5)).Children(func() {
+		ui.Text(c, fmt.Sprintf("Queued %d", len(a.queue))).FontSize(t.Rem(0.75)).
+			Bold().TextColor(t.TextMuted)
+		for _, q := range a.queue {
+			ui.Text(c, q.Display).FontSize(t.Rem(0.8)).TextColor(t.TextMuted).MaxLines(2)
+		}
+	})
+}
+
 func (a *app) composerKey(c *ui.Context, k ui.TextKey) bool {
 	if a.handleEsc(c, k) {
 		return true
@@ -803,6 +899,13 @@ func (a *app) composerKey(c *ui.Context, k ui.TextKey) bool {
 		k.SetText("")
 		return true
 	}
+	if k.Key == ui.KeyQ && k.Mods == ui.Cmd {
+		a.popQueue()
+		return true
+	}
+	if cmds := a.commandMatches(); len(cmds) > 0 && a.paletteKey(k, cmds) {
+		return true
+	}
 	if k.Key != ui.KeyEnter || k.Mods&ui.Shift != 0 {
 		return false
 	}
@@ -810,6 +913,31 @@ func (a *app) composerKey(c *ui.Context, k ui.TextKey) bool {
 		k.SetText("")
 	}
 	return true
+}
+
+// paletteKey moves the palette highlight and selects on Enter.
+func (a *app) paletteKey(k ui.TextKey, cmds []customCommand) bool {
+	if k.Key == ui.KeyUp {
+		a.paletteIndex--
+		if a.paletteIndex < 0 {
+			a.paletteIndex = len(cmds) - 1
+		}
+		return true
+	}
+	if k.Key == ui.KeyDown {
+		a.paletteIndex++
+		if a.paletteIndex >= len(cmds) {
+			a.paletteIndex = 0
+		}
+		return true
+	}
+	if k.Key == ui.KeyEnter && k.Mods&ui.Shift == 0 {
+		a.prompt = cmds[a.paletteIndex].Name + " "
+		a.focusInput = true
+		k.SetText(a.prompt)
+		return true
+	}
+	return false
 }
 
 // runningDialog lists tool calls still running. ACP reports delegated agents
@@ -832,9 +960,12 @@ func (a *app) runningDialog(c *ui.Context, t *ui.Theme) {
 			for _, i := range idx {
 				e := &a.transcript[i]
 				ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+					if label := kindLabel(e.ToolName, e.Text); label != "" {
+						ui.Text(c, label).FontSize(t.Rem(0.7)).TextColor(t.TextMuted).IgnoreInput(true)
+					}
+					ui.Text(c, e.Text).Grow(1).MaxLines(2)
 					ui.Badge(c, statusLabel(e.Status)).Background(statusColor(t, e.Status)).
 						TextColor(statusTextColor(t, e.Status))
-					ui.Text(c, e.Text).Grow(1).MaxLines(2)
 					ui.Text(c, elapsed(e.Started)).FontSize(t.Rem(0.75)).
 						TextColor(t.TextMuted).FontFeatures("tnum")
 				})

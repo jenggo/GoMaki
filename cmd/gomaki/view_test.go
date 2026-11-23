@@ -8,6 +8,7 @@ import (
 	"github.com/egoist/mygo/ui"
 
 	"gomaki/internal/acpclient"
+	"gomaki/internal/session"
 )
 
 func newTestApp() *app {
@@ -30,13 +31,17 @@ func TestViewRendersTranscript(t *testing.T) {
 }
 
 func TestPermissionDialogAnswers(t *testing.T) {
-	a := newTestApp()
 	reply := make(chan string, 1)
-	a.permission = &acpclient.PermissionRequest{
+	req := &acpclient.PermissionRequest{
 		Title:   "Run ls",
 		Options: []acpclient.PermissionOption{{ID: "allow_once", Name: "Allow once"}},
 		Reply:   reply,
 	}
+	core := session.New()
+	core.Handle(acpclient.Event{Kind: acpclient.EventPermission, Permission: req})
+	a := newTestApp()
+	a.core = core
+	a.permission = req
 	a.permissionOpen = true
 	tt := ui.NewTester(a.view, 900, 700)
 	if err := tt.Click("Allow once"); err != nil {
@@ -62,9 +67,8 @@ func TestSettingsDialogOpens(t *testing.T) {
 }
 
 func TestElicitationAnswers(t *testing.T) {
-	a := newTestApp()
 	reply := make(chan acpclient.ElicitationReply, 1)
-	a.startElicitation(&acpclient.ElicitationRequest{
+	req := &acpclient.ElicitationRequest{
 		Fields: []acpclient.ElicitationField{
 			{Name: "q1", Title: "Pick one", Options: []acpclient.ElicitationOption{
 				{Value: "A", Label: "A - first"},
@@ -77,7 +81,12 @@ func TestElicitationAnswers(t *testing.T) {
 			{Name: "q3", Title: "Type"},
 		},
 		Reply: reply,
-	})
+	}
+	core := session.New()
+	core.Handle(acpclient.Event{Kind: acpclient.EventElicitation, Elicitation: req})
+	a := newTestApp()
+	a.core = core
+	a.startElicitation(req)
 	a.multiAnswers["q2"] = map[string]bool{"Y": true}
 	a.answers["q3"] = "hello"
 	a.answerElicitation(false)
@@ -121,7 +130,7 @@ func TestEmptyState(t *testing.T) {
 	}
 
 	a = newTestApp()
-	a.client = &acpclient.Client{}
+	a.connected = true
 	tt = ui.NewTester(a.view, 900, 700)
 	if !tt.HasText("No stored sessions yet") {
 		t.Fatalf("missing empty sessions message: %q", tt.Texts())
@@ -133,7 +142,7 @@ func TestEmptyState(t *testing.T) {
 
 func TestSessionPickerEmpty(t *testing.T) {
 	a := newTestApp()
-	a.client = &acpclient.Client{}
+	a.connected = true
 	a.resumeOpen = true
 	tt := ui.NewTester(a.view, 900, 700)
 	if !tt.HasText("No stored sessions yet") {
@@ -143,7 +152,7 @@ func TestSessionPickerEmpty(t *testing.T) {
 
 func TestFirstScreenListsSessions(t *testing.T) {
 	a := newTestApp()
-	a.client = &acpclient.Client{}
+	a.connected = true
 	a.sessions = []acpclient.SessionInfo{{
 		ID: "s1", Title: "Previous session", UpdatedAt: "2026-11-14T09:28:59Z",
 	}}
@@ -269,9 +278,18 @@ func TestTodoToolCallRendersList(t *testing.T) {
 		Text:      "2 todos",
 		Status:    toolCompleted,
 		ToolInput: input,
-		Todos:     parseTodos(input),
+		Todos:     session.ParseTodos(input),
 	}}
 	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+	if tt.HasText("write tests") || tt.HasText("ship it") {
+		t.Fatal("todo list was expanded by default")
+	}
+	r, ok := tt.Find("2 todos")
+	if !ok {
+		t.Fatal("todo tool header not found")
+	}
+	tt.ClickAt(r.X+2, r.Y+r.H/2)
 	if !tt.HasText("write tests") || !tt.HasText("ship it") {
 		t.Fatalf("todo items missing: %q", tt.Texts())
 	}
@@ -281,33 +299,12 @@ func TestTodoToolCallRendersList(t *testing.T) {
 }
 
 func TestParseTodos(t *testing.T) {
-	todos := parseTodos(`{"todos":[{"content":"a","status":"pending"}]}`)
+	todos := session.ParseTodos(`{"todos":[{"content":"a","status":"pending"}]}`)
 	if len(todos) != 1 || todos[0].Content != "a" || todos[0].Status != "pending" {
 		t.Fatalf("todos = %+v", todos)
 	}
-	if parseTodos(`{"path":"go.mod"}`) != nil {
+	if session.ParseTodos(`{"path":"go.mod"}`) != nil {
 		t.Fatal("non-todo input parsed as todos")
-	}
-}
-
-func TestPromptDoneRestoresDraft(t *testing.T) {
-	a := newTestApp()
-	a.busy = true
-	a.stopping = true
-	a.lastPrompt = "hello"
-	a.promptDone(acpclient.Event{StopReason: "cancelled"})
-	if a.busy || a.prompt != "hello" || a.notice != "Stopped — prompt restored" {
-		t.Fatalf("busy=%v prompt=%q notice=%q", a.busy, a.prompt, a.notice)
-	}
-}
-
-func TestPromptDoneKeepsDraftOnSuccess(t *testing.T) {
-	a := newTestApp()
-	a.busy = true
-	a.lastPrompt = "hello"
-	a.promptDone(acpclient.Event{StopReason: "end_turn"})
-	if a.busy || a.prompt != "" || a.lastPrompt != "" {
-		t.Fatalf("busy=%v prompt=%q last=%q", a.busy, a.prompt, a.lastPrompt)
 	}
 }
 
@@ -360,27 +357,9 @@ func TestMissingMakiError(t *testing.T) {
 	}
 }
 
-func TestRewindLastTurn(t *testing.T) {
-	a := newTestApp()
-	a.transcript = []entry{
-		{Kind: entryUser, Text: "first"},
-		{Kind: entryAgent, Text: "answer one"},
-		{Kind: entryUser, Text: "lorem ipsum"},
-		{Kind: entryAgent, Text: "answer two"},
-		{Kind: entryTool, Text: "bash", Status: toolCompleted},
-	}
-	a.rewindLastTurn()
-	if len(a.transcript) != 2 {
-		t.Fatalf("transcript len = %d", len(a.transcript))
-	}
-	if a.prompt != "lorem ipsum" || a.notice != "Last prompt restored" {
-		t.Fatalf("prompt = %q notice = %q", a.prompt, a.notice)
-	}
-}
-
 func TestCtrlCClearsComposer(t *testing.T) {
 	a := newTestApp()
-	a.client = &acpclient.Client{}
+	a.connected = true
 	tt := ui.NewTester(a.view, 1000, 720)
 	tt.Frame()
 	tt.Type("draft")
@@ -395,7 +374,7 @@ func TestCtrlCClearsComposer(t *testing.T) {
 
 func TestUsageInStatusBar(t *testing.T) {
 	a := newTestApp()
-	a.client = &acpclient.Client{}
+	a.connected = true
 	a.sessionID = "s"
 	a.contextUsed = 27394
 	a.contextSize = 200000
@@ -430,15 +409,13 @@ func TestThoughtCollapsesAndExpands(t *testing.T) {
 
 func TestEagerSessionFillsMenusAndKeepsSessionList(t *testing.T) {
 	a := newTestApp()
-	a.client = &acpclient.Client{}
+	a.connected = true
 	a.sessions = []acpclient.SessionInfo{{ID: "old", Title: "Earlier work"}}
-	a.applySession(acpclient.Session{
-		ID:     "new",
-		Model:  "acme/fast",
-		Models: []string{"acme/fast"},
-		Mode:   "build",
-		Modes:  []string{"build", "plan"},
-	})
+	a.sessionID = "new"
+	a.models = []string{"acme/fast"}
+	a.model = "acme/fast"
+	a.modes = []string{"build", "plan"}
+	a.mode = "build"
 
 	tt := ui.NewTester(a.view, 1000, 720)
 	if !tt.HasText("Previous sessions") {
@@ -504,7 +481,7 @@ func TestModeColorsAreDistinct(t *testing.T) {
 
 func TestCtrlCCopiesSelection(t *testing.T) {
 	a := newTestApp()
-	a.client = &acpclient.Client{}
+	a.connected = true
 	a.transcript = []entry{{Kind: entryAgent, Text: "copy this sentence"}}
 	tt := ui.NewTester(a.view, 1000, 720)
 	tt.Frame()
@@ -530,7 +507,7 @@ func TestCtrlCCopiesSelection(t *testing.T) {
 
 func TestCtrlCWithComposerFocusedCopiesSelection(t *testing.T) {
 	a := newTestApp()
-	a.client = &acpclient.Client{}
+	a.connected = true
 	a.transcript = []entry{{Kind: entryAgent, Text: "copy this sentence"}}
 	tt := ui.NewTester(a.view, 1000, 720)
 	tt.Frame()
@@ -544,6 +521,28 @@ func TestCtrlCWithComposerFocusedCopiesSelection(t *testing.T) {
 	}
 	if got := tt.Clipboard(); got != "copy this sentence" {
 		t.Fatalf("clipboard = %q", got)
+	}
+}
+
+func TestToolDetailsWrapCode(t *testing.T) {
+	a := newTestApp()
+	if !a.toolMD.WrapCode {
+		t.Fatal("tool markdown must wrap code blocks")
+	}
+	if a.md.WrapCode {
+		t.Fatal("agent markdown must keep its existing code layout")
+	}
+}
+
+func TestKindLabelHidesDuplicates(t *testing.T) {
+	if got := kindLabel("read", "read"); got != "" {
+		t.Fatalf("duplicate label = %q, want empty", got)
+	}
+	if got := kindLabel("read", "File ~/x"); got != "read" {
+		t.Fatalf("label = %q, want read", got)
+	}
+	if got := kindLabel("", "read"); got != "" {
+		t.Fatalf("empty kind = %q, want empty", got)
 	}
 }
 
@@ -581,55 +580,18 @@ func TestPlanPanelShowsProgressAndExpands(t *testing.T) {
 	}
 }
 
-func TestPlanPathCapturedInPlanMode(t *testing.T) {
+func TestPlanActionRequiresFFCommand(t *testing.T) {
 	a := newTestApp()
-	a.mode = modePlan
-	a.apply(acpclient.Event{
-		Kind:       acpclient.EventToolCall,
-		ToolCallID: "t1",
-		Title:      "write plan",
-		ToolKind:   toolKindEdit,
-	})
-	a.apply(acpclient.Event{
-		Kind:       acpclient.EventToolCallUpdate,
-		ToolCallID: "t1",
-		ToolInput:  `{"path":"/state/plans/x.md","content":"plan"}`,
-	})
-	if a.planPath != "/state/plans/x.md" {
-		t.Fatalf("planPath = %q", a.planPath)
-	}
-	a.apply(acpclient.Event{
-		Kind:       acpclient.EventToolCall,
-		ToolCallID: "t2",
-		Title:      "read file",
-		ToolKind:   "read",
-		ToolInput:  `{"path":"/repo/x.go"}`,
-	})
-	if a.planPath != "/state/plans/x.md" {
-		t.Fatalf("read changed planPath to %q", a.planPath)
-	}
-}
-
-func TestPlanReadyAfterPlanTurn(t *testing.T) {
-	a := newTestApp()
-	a.mode = modePlan
-	a.commands = []customCommand{{Name: "/opsx:ff", Content: "FF body."}}
-	a.planPath = "/state/plans/x.md"
-	a.promptDone(acpclient.Event{StopReason: "end_turn"})
-	if !a.planReady {
-		t.Fatal("plan action missing after a plan turn")
-	}
+	a.planReady = true
 	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+	if tt.HasText("Create change from plan") {
+		t.Fatal("plan action shown without the ff command")
+	}
+	a.commands = []customCommand{{Name: "/opsx:ff", Content: "FF body."}}
 	tt.Frame()
 	if !tt.HasText("Create change from plan") {
 		t.Fatalf("plan action not rendered: %q", tt.Texts())
-	}
-
-	a.planReady = false
-	a.commands = nil
-	a.promptDone(acpclient.Event{StopReason: "end_turn"})
-	if a.planReady {
-		t.Fatal("plan action shown without the ff command")
 	}
 }
 
@@ -663,5 +625,90 @@ func TestRunningDialogListsRunningTools(t *testing.T) {
 	tt.ClickAt(r.X+2, r.Y+r.H/2)
 	if !tt.HasText("Tool calls still in progress.") {
 		t.Fatal("running dialog did not open")
+	}
+}
+
+func TestCommandPaletteKeyboard(t *testing.T) {
+	a := newTestApp()
+	a.connected = true
+	a.cwd = "/test"
+	a.commandsCwd = "/test"
+	a.commands = []customCommand{
+		{Name: "/project:alpha", Description: "Alpha"},
+		{Name: "/project:beta", Description: "Beta"},
+	}
+	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+	tt.Type("/")
+	if a.prompt != "/" {
+		t.Fatalf("prompt = %q", a.prompt)
+	}
+	tt.Key(0, ui.KeyDown)
+	tt.Frame()
+	if a.paletteIndex != 1 {
+		t.Fatalf("palette index = %d, want 1", a.paletteIndex)
+	}
+	tt.Key(0, ui.KeyEnter)
+	tt.Frame()
+	if a.prompt != "/project:beta " {
+		t.Fatalf("prompt after Enter = %q", a.prompt)
+	}
+}
+
+func TestTodoPanelPinsAndCollapses(t *testing.T) {
+	a := newTestApp()
+	a.transcript = []entry{{
+		Kind:     entryTool,
+		Text:     "todo_write",
+		ToolID:   "todo-1",
+		Status:   toolRunning,
+		TodoList: true,
+		Todos: []acpclient.PlanEntry{
+			{Content: "write tests", Status: toolCompleted},
+			{Content: "ship it", Status: toolRunning},
+		},
+	}}
+	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+	if !tt.HasText("Tasks 1 of 2") {
+		t.Fatalf("todo header missing: %q", tt.Texts())
+	}
+	if tt.HasText("write tests") {
+		t.Fatalf("todo list was expanded by default: %q", tt.Texts())
+	}
+	r, ok := tt.Find("Tasks 1 of 2")
+	if !ok {
+		t.Fatal("todo header not found")
+	}
+	tt.ClickAt(r.X+2, r.Y+r.H/2)
+	if !tt.HasText("write tests") || !tt.HasText("ship it") {
+		t.Fatalf("todo list did not expand: %q", tt.Texts())
+	}
+}
+
+func TestTodoPanelClosesWhenDone(t *testing.T) {
+	a := newTestApp()
+	a.transcript = []entry{{
+		Kind:     entryTool,
+		Text:     "todo_write",
+		ToolID:   "todo-1",
+		Status:   toolCompleted,
+		TodoList: true,
+		Todos: []acpclient.PlanEntry{
+			{Content: "write tests", Status: toolCompleted},
+			{Content: "ship it", Status: toolCompleted},
+		},
+	}}
+	tt := ui.NewTester(a.view, 1000, 720)
+	tt.Frame()
+	if !tt.HasText("Tasks 2 of 2") {
+		t.Fatalf("todo header missing: %q", tt.Texts())
+	}
+	if err := tt.Click("×"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if tt.HasText("Tasks 2 of 2") {
+		t.Fatalf("todo panel did not close: %q", tt.Texts())
 	}
 }

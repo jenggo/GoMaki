@@ -20,9 +20,15 @@ var appIconSmall []byte
 
 func main() {
 	continueLast := flag.Bool("c", false, "continue the most recent session")
+	password := flag.String("password", "", "password for HTTP Mode")
+	listen := flag.String("listen", "", "address to bind in HTTP Mode")
+	port := flag.Int("port", 0, "port for HTTP Mode")
 	flag.Parse()
 	a := newApp()
 	a.continueLast = *continueLast
+	a.password = *password
+	a.listen = *listen
+	a.port = *port
 	a.cwd, _ = os.Getwd()
 	mygo.App.OnBeforeQuit(func(e *mygo.QuitEvent) {
 		if a.busy && !a.quitting {
@@ -30,8 +36,9 @@ func main() {
 			a.confirmQuit()
 			return
 		}
-		if a.client != nil {
-			_ = a.client.Close()
+		a.stopHTTP()
+		if a.core != nil {
+			_ = a.core.Close()
 		}
 	})
 	mygo.App.WhenReady(func() {
@@ -46,7 +53,7 @@ func main() {
 			Content: ui.View(a.view),
 		})
 		if err := a.win.SetIcon(appIcon); err != nil {
-			log.Printf("set window icon: %v", err)
+			log.Printf("window icon: %v", err)
 		}
 		a.win.OnClose(func(e *mygo.CloseEvent) {
 			if a.busy && !a.quitting {

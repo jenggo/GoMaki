@@ -20,7 +20,7 @@ func TestRealTurn(t *testing.T) {
 		t.Skip("maki is not on PATH")
 	}
 
-	c, err := Start()
+	c, err := Start("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestRealTurn(t *testing.T) {
 				text.WriteString(e.Text)
 			case EventToolCall:
 				sawTool = true
-			case EventUserText, EventThought, EventToolCallUpdate, EventPlan, EventConfig, EventMode, EventPermission, EventElicitation, EventUsage:
+			case EventUserText, EventThought, EventToolCallUpdate, EventPlan, EventConfig, EventMode, EventPermission, EventElicitation, EventUsage, EventCommands:
 			case EventPromptDone:
 				if e.Err != nil {
 					t.Fatalf("prompt failed: %v", e.Err)
@@ -77,7 +77,7 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Skip("maki is not on PATH")
 	}
 
-	c, err := Start()
+	c, err := Start("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func replayed(c *Client) bool {
 			switch e.Kind {
 			case EventUserText, EventText, EventThought, EventToolCall, EventPlan:
 				return true
-			case EventToolCallUpdate, EventConfig, EventMode, EventPermission, EventElicitation, EventUsage, EventPromptDone:
+			case EventToolCallUpdate, EventConfig, EventMode, EventPermission, EventElicitation, EventUsage, EventCommands, EventPromptDone:
 			}
 		case <-deadline:
 			return false
@@ -143,7 +143,7 @@ func replayed(c *Client) bool {
 
 func TestStartMissingBinary(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	if _, err := Start(); err == nil {
+	if _, err := Start(""); err == nil {
 		t.Fatal("Start succeeded without maki on PATH")
 	}
 }

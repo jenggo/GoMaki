@@ -1,29 +1,29 @@
 package acpclient
 
-import "testing"
+import (
+	"testing"
+
+	acp "github.com/coder/acp-go-sdk"
+)
 
 func TestParseFields(t *testing.T) {
-	props := map[string]any{
-		"q2": map[string]any{
-			"type":  "array",
-			"title": "Pick some",
-			"items": map[string]any{
-				"type": "string",
-				"enum": []any{"X", "Y"},
+	props := map[string]acp.ElicitationPropertySchema{
+		"q2": {Array: &acp.ElicitationPropertySchemaArray{
+			Title: new("Pick some"),
+			Items: acp.MultiSelectItems{String: &acp.MultiSelectItemsString{
+				Enum: []string{"X", "Y"},
+			}},
+		}},
+		"q1": {String: &acp.ElicitationPropertySchemaString{
+			Title: new("Choose one"),
+			OneOf: []acp.EnumOption{
+				{Const: "A", Title: "A - first"},
+				{Const: "B", Title: "B - second"},
 			},
-		},
-		"q1": map[string]any{
-			"type":  "string",
-			"title": "Choose one",
-			"oneOf": []any{
-				map[string]any{"const": "A", "title": "A - first"},
-				map[string]any{"const": "B", "title": "B - second"},
-			},
-		},
-		"q3": map[string]any{
-			"type":  "string",
-			"title": "Type anything",
-		},
+		}},
+		"q3": {String: &acp.ElicitationPropertySchemaString{
+			Title: new("Type anything"),
+		}},
 	}
 
 	fields := parseFields(props)

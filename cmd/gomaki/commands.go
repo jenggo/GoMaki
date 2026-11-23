@@ -41,7 +41,7 @@ func discoverCommands(cwd string) []customCommand {
 
 func discoverCommandsIn(cwd, home, config string) []customCommand {
 	byName := make(map[string]customCommand)
-	addOpsxSkills(byName, config)
+	addOpsxSkills(byName, home)
 
 	addDir := func(dir string, project bool) {
 		entries, err := os.ReadDir(dir)
@@ -110,11 +110,11 @@ var opsxSkills = []struct{ id, skill string }{
 // addOpsxSkills exposes the globally installed OpenSpec skills as /opsx:<id>
 // commands. It reads the same files the opsx plugin reads and adds no state of
 // its own: no skills on disk, no commands in the palette.
-func addOpsxSkills(byName map[string]customCommand, config string) {
-	if config == "" {
+func addOpsxSkills(byName map[string]customCommand, home string) {
+	if home == "" {
 		return
 	}
-	skills := filepath.Join(config, "maki", ".agents", "skills")
+	skills := filepath.Join(home, ".agents", "skills")
 	for _, o := range opsxSkills {
 		cmd, ok := readCommand(filepath.Join(skills, o.skill, "SKILL.md"), false)
 		if !ok {
@@ -190,11 +190,26 @@ func (a *app) commandMatches() []customCommand {
 	}
 	query := strings.ToLower(strings.TrimPrefix(text, "/"))
 	var matches []customCommand
+	seen := make(map[string]bool)
 	for _, cmd := range a.commands {
 		if query != "" && !strings.Contains(strings.ToLower(cmd.Name), query) {
 			continue
 		}
 		matches = append(matches, cmd)
+		seen[strings.ToLower(cmd.Name)] = true
+		if len(matches) == 8 {
+			break
+		}
+	}
+	for _, cmd := range a.acpCommands {
+		if query != "" && !strings.Contains(strings.ToLower(cmd.Name), query) {
+			continue
+		}
+		name := "/" + cmd.Name
+		if seen[strings.ToLower(name)] {
+			continue
+		}
+		matches = append(matches, customCommand{Name: name, Description: cmd.Description})
 		if len(matches) == 8 {
 			break
 		}
@@ -213,6 +228,12 @@ func (a *app) matchCommand(text string) (customCommand, string, bool) {
 }
 
 func (a *app) expandedPrompt(text string) string {
+	head, _, _ := strings.Cut(text, " ")
+	for _, cmd := range a.acpCommands {
+		if "/"+cmd.Name == head {
+			return text
+		}
+	}
 	cmd, args, ok := a.matchCommand(text)
 	if !ok {
 		return text
