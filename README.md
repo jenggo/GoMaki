@@ -20,7 +20,7 @@ Maki still does the work. GoMaki is a front end: sessions, prompts, tool calls, 
 - Token usage in the status bar (`27.4k/200k (14%)`), with cost when Maki reports it.
 - The status bar shows the workspace folder and its Git branch (`project (main)`), plus an icon for ready or working.
 - Light and dark themes, a system theme, and a monospace-only font picker with font sizes.
-- Custom slash commands from your user and project command folders.
+- Custom slash commands from your user and project command folders, plus the commands Maki announces over ACP.
 - Copy from the transcript with right-click, or with Ctrl+C after selecting text.
 - Reload the app from File > Reload (Cmd+R) or `/reload`, resuming the current session.
 
@@ -28,7 +28,7 @@ Maki still does the work. GoMaki is a front end: sessions, prompts, tool calls, 
 
 - Linux with OpenGL. This is the only target for now.
 - Go 1.27 or newer to build.
-- `maki` on `PATH`, with at least one provider authenticated. Run `maki auth status` if you are not sure.
+- `maki` on `PATH`, version 0.7.3 or newer, with at least one provider authenticated. Run `maki auth status` if you are not sure. The version floor exists because 0.7.3 is the first release that announces its slash commands over ACP; older versions run, but their commands never reach the palette.
 - A project folder Maki can work in.
 
 GoMaki starts Maki as:
@@ -59,7 +59,7 @@ make build
 ./dist/gomaki
 ```
 
-Add `-c` to continue the most recent session in the current folder:
+Add `-c` (or `--continue`) to continue the most recent session in the current folder:
 
 ```sh
 ./gomaki -c
@@ -72,14 +72,14 @@ Launch it from the project you want to work in. The session list starts there. F
 Use the same session from a phone or tablet:
 
 ```sh
-./gomaki -password 'your-password'
+./gomaki -p 'your-password'
 ```
 
-Passing `-password` starts HTTP Mode with the app, so the window shows the reachable URL(s) and a Cancel button. The server binds `0.0.0.0`; add `--listen <addr>` to restrict the interface and `--port <n>` to choose a port.
+Passing `-p` (or `--password`) starts HTTP Mode with the app, so the window shows the reachable URL(s) and a Cancel button. The server binds `0.0.0.0`; add `-l <addr>` (or `--listen`) to restrict the interface and `-P <n>` (or `--port`) to choose a port.
 
-Without `-password`, File > HTTP Mode still works: it binds `127.0.0.1` only and skips the login page. It does not prompt for a password before starting. That mode serves plain HTTP, because browsers treat loopback as a secure context, so there is no certificate warning to accept.
+Without `-p`, File > HTTP Mode still works: it binds `127.0.0.1` only and skips the login page. It does not prompt for a password before starting. That mode serves plain HTTP, because browsers treat loopback as a secure context, so there is no certificate warning to accept.
 
-With `-password` the server uses TLS. The certificate is self-signed and generated on first use. Accept the browser warning once per device. The web UI follows the system light/dark preference and has a toggle in the header.
+With `-p` the server uses TLS. The certificate is self-signed and generated on first use. Accept the browser warning once per device. The web UI follows the system light/dark preference and has a toggle in the header.
 
 ## First open
 
@@ -100,7 +100,7 @@ If `maki` is missing, the window stays open and shows the error at the top. Inst
 | Cmd+Shift+A | Attach an image or file to the next prompt |
 | Cmd+R | Reload the app and resume the current session |
 | Cmd+Shift+B | Open the running-tasks window |
-| `/` | Open the custom command palette |
+| `/` | Open the command palette |
 | Up / Down | Move the palette highlight |
 | Enter | Select the highlighted command, or send the composer text |
 | Ctrl+Q | Pull the first queued prompt back into the composer |
@@ -120,9 +120,27 @@ GoMaki reads the same command folders as Maki:
 
 Commands are Markdown files. Frontmatter can set `name` and `description`. `$ARGUMENTS` in the body is replaced with what you type after the command. Project commands override user commands, and the repo root wins over nested folders.
 
-Type `/` in the composer and pick one. If you add a file while GoMaki is running, use File > Reload Commands. The transcript shows the command line; Maki receives the expanded prompt.
+Type `/` in the composer and pick one. If you add a file while GoMaki is running, use File > Reload Commands. The transcript shows the command line; GoMaki expands local commands before sending, while commands Maki announced are sent as typed.
 
-Maki's built-in TUI commands such as `/help`, `/model`, `/theme`, `/sessions`, and `/compact` are not exposed over ACP today. `/new` is a GoMaki built-in, handled before the prompt reaches the agent. Use GoMaki's model menu, the mode in the status bar, and the session picker instead. `/compact` cannot be run over ACP: the agent builds a plain prompt from the text, so it would reach the model literally.
+### What Maki sends over ACP
+
+Maki announces its slash commands over ACP as an `available_commands_update` on every new and resumed session. This starts in Maki 0.7.3; earlier releases send no command list. GoMaki merges that list into the `/` palette with a leading `/`, after its own local commands. Selecting one sends the command line unchanged: Maki expands the template on its side.
+
+Transferred over ACP:
+
+- `/compact`, Maki's built-in history compaction.
+- `user:<name>` commands from `~/.config/maki/commands/`.
+- `project:<name>` commands from the project command folders.
+- MCP prompts, when a connected server defines them.
+
+Not transferred over ACP:
+
+- **Plugin commands registered from Lua** with `maki.api.register_command`. They run inside Maki's own TUI and never reach an ACP client. This covers all twelve `/opsx:*` commands and any other plugin command.
+- Maki's other TUI built-ins: `/help`, `/model`, `/theme`, `/sessions`, `/reload`, and so on. Use GoMaki's model menu, the mode in the status bar, the session picker, and File > Reload instead.
+
+GoMaki works around the plugin gap only where it can do so from the same files the plugin reads. `/opsx:*` is rebuilt locally (see below) because the skills live on disk. A plugin command with no on-disk equivalent has no GoMaki counterpart and does not appear in the palette.
+
+`/new` is a GoMaki built-in, handled before the prompt reaches the agent.
 
 ### OpenSpec skills
 
@@ -136,7 +154,7 @@ After a plan-mode turn writes its plan, a **Create change from plan** action app
 
 ## Limitations
 
-- ACP is the boundary. Anything Maki's TUI does without sending a prompt is not available here. That includes built-in slash commands and MCP prompts in the Maki version this was built against.
+- ACP is the boundary. Anything Maki's TUI does without sending a prompt is not available here. That includes its built-in slash commands and every command a Lua plugin registers; [What Maki sends over ACP](#what-maki-sends-over-acp) lists which commands do cross.
 - Background jobs and delegated agents are only visible as far as Maki reports them over ACP. A subagent arrives as a tool call; a background job that outlives its tool call may only show up again when its result lands in the conversation. The running-tasks window lists tool calls still marked in progress.
 - The session list follows the current working folder. It starts as the folder you launched from; File > Open Directory changes it.
 - A session that is already open in another Maki process cannot be loaded. GoMaki shows the error instead of closing silently.

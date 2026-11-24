@@ -76,6 +76,8 @@ type State struct {
 	Branch     string
 	Transcript []Entry
 	Plan       []acpclient.PlanEntry
+	Todos      []acpclient.PlanEntry
+	TodoToolID string
 
 	Models   []string
 	Modes    []string
@@ -245,6 +247,7 @@ func (c *Core) applyEventLocked(e acpclient.Event) string {
 		}
 		c.capturePlanPathLocked(e.ToolKind, e.ToolInput)
 		todos, todoList := parseTodos(e.ToolInput)
+		c.pinTodosLocked(e.ToolCallID, todos, todoList)
 		c.state.Transcript = append(c.state.Transcript, Entry{
 			Kind:       EntryTool,
 			Text:       e.Title,
@@ -621,6 +624,7 @@ func (c *Core) snapshotLocked() State {
 		s.Transcript[i].Todos = slices.Clone(s.Transcript[i].Todos)
 	}
 	s.Plan = slices.Clone(c.state.Plan)
+	s.Todos = slices.Clone(c.state.Todos)
 	s.Models = slices.Clone(c.state.Models)
 	s.Modes = slices.Clone(c.state.Modes)
 	s.Sessions = slices.Clone(c.state.Sessions)
@@ -786,6 +790,7 @@ func (c *Core) updateToolCallLocked(e acpclient.Event) {
 		if e.ToolInput != "" {
 			entry.ToolInput = e.ToolInput
 			entry.Todos, entry.TodoList = parseTodos(e.ToolInput)
+			c.pinTodosLocked(entry.ToolID, entry.Todos, entry.TodoList)
 			c.capturePlanPathLocked(entry.ToolKind, e.ToolInput)
 		}
 		if e.ToolOutput != "" {
@@ -793,6 +798,16 @@ func (c *Core) updateToolCallLocked(e acpclient.Event) {
 		}
 		return
 	}
+}
+
+// pinTodosLocked keeps the newest todo list at the session level so a renderer
+// that only sees a window of the transcript still shows the task panel.
+func (c *Core) pinTodosLocked(toolID string, todos []acpclient.PlanEntry, ok bool) {
+	if !ok {
+		return
+	}
+	c.state.TodoToolID = toolID
+	c.state.Todos = todos
 }
 
 // toolHeader rebuilds the line a live tool call shows in its header, from the
@@ -883,6 +898,8 @@ func (c *Core) resetLocked() {
 	s := &c.state
 	s.Transcript = nil
 	s.Plan = nil
+	s.Todos = nil
+	s.TodoToolID = ""
 	s.PlanPath = ""
 	s.PlanReady = false
 	s.Busy = false

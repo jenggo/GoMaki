@@ -49,11 +49,11 @@
 
 <style>
   .tool {
-    border: 1px solid var(--border);
+    border: 1px solid var(--tool-border);
+    border-left: 3px solid var(--tool-accent);
     border-radius: 12px;
-    background: var(--surface);
+    background: var(--tool-bg);
     overflow: hidden;
-    box-shadow: var(--shadow-sm);
   }
   .head {
     display: flex;
@@ -70,17 +70,18 @@
   .chevron {
     color: var(--muted);
   }
+  .tool-kind {
+    font-size: 0.68rem;
+    color: var(--tool-accent);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
   .title {
     flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .tool-kind {
-    font-size: 0.68rem;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    font-weight: 500;
   }
   .status {
     font-size: 0.68rem;
@@ -99,7 +100,7 @@
     color: var(--warning);
   }
   .body {
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--tool-border);
     padding: 10px 12px;
   }
   .label {

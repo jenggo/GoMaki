@@ -23,20 +23,10 @@
   let sseOpen = true;
   let snapshotError = "";
   let sessionChoice = "";
+  let sessionTitle = "";
   let pendingUpdates = [];
   let flushScheduled = false;
   let loadingEarlier = false;
-
-  // ?debug=1 shows what the page receives and how often it renders, to tell a
-  // stream flood apart from a rendering loop.
-  const debug = new URLSearchParams(location.search).has("debug");
-  const raw = new URLSearchParams(location.search).has("raw");
-  let debugText = "";
-  let msgCount = 0;
-  let renderCount = 0;
-  let openCount = 0;
-  let errorCount = 0;
-  let snapshotCount = 0;
   let lastSnapshotAt = 0;
 
   function normalize(s) {
@@ -45,6 +35,8 @@
       transcript: s.transcript || [],
       transcriptStart: s.transcriptStart || 0,
       plan: s.plan || [],
+      todos: s.todos || [],
+      todoToolId: s.todoToolId || "",
       models: s.models || [],
       modes: s.modes || [],
       sessions: s.sessions || [],
@@ -56,6 +48,8 @@
     return {
       transcript: [],
       plan: [],
+      todos: [],
+      todoToolId: "",
       models: [],
       modes: [],
       queue: [],
@@ -82,21 +76,12 @@
   $: if (matches.length && paletteIndex >= matches.length) paletteIndex = 0;
   $: dark = theme === "dark";
   $: connection = sseOpen ? "" : "Reconnecting…";
-  $: todo = latestTodo(state.transcript);
+  $: todo = state.todos?.length ? { id: state.todoToolId, todos: state.todos } : null;
+  $: sessionTitle = firstPrompt(state.transcript);
   $: if (todo && todo.id !== todoToolID) {
     todoToolID = todo.id;
     todoExpanded = false;
     todoDismissed = "";
-  }
-
-  function latestTodo(transcript) {
-    for (let i = transcript.length - 1; i >= 0; i--) {
-      const entry = transcript[i];
-      if (entry.kind === "tool" && entry.todoList) {
-        return { id: entry.toolId, todos: entry.todos || [] };
-      }
-    }
-    return null;
   }
 
   function todoDone(todos) {
@@ -124,7 +109,6 @@
     const now = Date.now();
     if (now - lastSnapshotAt < 1000) return;
     lastSnapshotAt = now;
-    snapshotCount++;
     try {
       state = mergeState(normalize(await snapshot()));
       pendingUpdates = [];
@@ -144,32 +128,16 @@
       }
     };
     media.addEventListener("change", onSystemTheme);
-    const stream = !new URLSearchParams(location.search).has("nostream");
-    let close = () => {};
-    let poll = 0;
-    if (stream) {
-      close = events(applyUpdate, (open) => {
-        if (open) openCount++;
-        else errorCount++;
-        sseOpen = open;
-        if (open) refreshSnapshot();
-      });
-      poll = setInterval(() => {
-        if (!sseOpen) refreshSnapshot();
-      }, 10000);
-    }
-    const meter = debug
-      ? setInterval(() => {
-          debugText = `sse ${msgCount}/s render ${renderCount}/s open ${openCount} err ${errorCount} snap ${snapshotCount}`;
-          document.title = debugText;
-          msgCount = 0;
-          renderCount = 0;
-        }, 1000)
-      : 0;
+    const close = events(applyUpdate, (open) => {
+      sseOpen = open;
+      if (open) refreshSnapshot();
+    });
+    const poll = setInterval(() => {
+      if (!sseOpen) refreshSnapshot();
+    }, 10000);
     return () => {
       close();
       clearInterval(poll);
-      clearInterval(meter);
       media.removeEventListener("change", onSystemTheme);
     };
   });
@@ -191,12 +159,27 @@
     }
   }
 
+  function firstPrompt(transcript) {
+    const first = transcript.find((e) => e.kind === "user");
+    if (!first) return "";
+    const line = first.text.trim().split("\n")[0];
+    return line.length > 48 ? line.slice(0, 48) + "…" : line;
+  }
+
   function statusText() {
     if (state.busy) return state.status || "Working…";
     if (state.notice) return state.notice;
     if (state.status) return state.status;
+    if (sessionTitle) return sessionTitle;
     if (!state.sessionId) return "No session";
     return "Ready";
+  }
+
+  async function toggleTodo() {
+    const stick = autoScroll;
+    todoExpanded = !todoExpanded;
+    await tick();
+    if (stick && transcriptEl) transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
   const MODE_COLORS = { build: "#d9a300", plan: "#3b82f6" };
@@ -227,7 +210,6 @@
   }
 
   function applyUpdate(u) {
-    msgCount++;
     pendingUpdates.push(u);
     if (!flushScheduled) {
       flushScheduled = true;
@@ -237,7 +219,6 @@
 
   function flushUpdates() {
     flushScheduled = false;
-    renderCount++;
     const batch = pendingUpdates;
     pendingUpdates = [];
     for (const u of batch) applyUpdateNow(u);
@@ -301,8 +282,16 @@
           todos: e.todos || [],
           todoList: !!e.todoList,
         });
+        if (e.todoList) {
+          state.todos = e.todos || [];
+          state.todoToolId = e.toolId;
+        }
         break;
       case "toolUpdate": {
+        if (e.todoList) {
+          state.todos = e.todos || [];
+          state.todoToolId = e.toolId;
+        }
         const entry = [...t].reverse().find((x) => x.kind === "tool" && x.toolId === e.toolId);
         if (entry) {
           if (e.title) entry.text = e.title;
@@ -670,9 +659,7 @@
         </div>
       {/if}
       {#each state.transcript as entry, index (state.transcriptStart + index)}
-        {#if raw}
-          <div class="entry">{entry.kind}: {entry.text}</div>
-        {:else if entry.kind === "user"}
+        {#if entry.kind === "user"}
           <div class="entry user">{entry.text}</div>
         {:else if entry.kind === "agent"}
           <div class="entry agent">
@@ -713,11 +700,11 @@
           class="panel-head"
           role="button"
           tabindex="0"
-          on:click={() => (todoExpanded = !todoExpanded)}
+          on:click={toggleTodo}
           on:keydown={(e) => {
             if (e.key === "Enter" || e.key === " ") {
               e.preventDefault();
-              todoExpanded = !todoExpanded;
+              toggleTodo();
             }
           }}
         >
@@ -800,7 +787,6 @@
       <div class="status">
         <span class="dot" class:busy={state.busy}></span>
         <span class="state">{connection || statusText()}</span>
-        {#if debug}<span class="meta">{debugText}</span>{/if}
         <button
           class="mode-chip"
           style={`--mode-color: ${modeColor(state.mode)}`}
@@ -1075,40 +1061,47 @@
     box-shadow: var(--shadow-sm);
   }
   .entry.thought {
-    border: 1px dashed var(--border);
+    background: var(--thought-bg);
+    border: 1px solid var(--thought-border);
+    border-left: 3px solid var(--thought-accent);
     border-radius: 12px;
-    padding: 8px 12px;
-    color: var(--muted);
+    color: var(--thought-text);
     font-size: 0.85rem;
   }
   .thought-head {
     background: transparent;
     border: 0;
-    padding: 0;
+    border-radius: 12px;
+    padding: 8px 12px;
     min-height: 0;
-    color: var(--muted);
+    color: var(--thought-text);
     font-size: 0.82rem;
-    display: inline-flex;
+    display: flex;
+    width: 100%;
     align-items: center;
+    text-align: left;
     gap: 6px;
   }
   .thought-head.static {
-    color: var(--muted);
+    color: var(--thought-text);
     font-size: 0.82rem;
   }
   .thought-roll {
-    margin-top: 6px;
-    max-height: 4.5em;
+    padding: 0 12px 8px;
+    max-height: 9em;
     overflow: hidden;
     -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.6em);
     mask-image: linear-gradient(to bottom, transparent 0, #000 1.6em);
   }
   .thought-body {
-    margin-top: 8px;
+    padding: 0 12px 8px;
   }
   .chevron {
     color: var(--muted);
     font-size: 0.75rem;
+  }
+  .entry.thought .chevron {
+    color: var(--thought-accent);
   }
 
   .panels {
@@ -1355,6 +1348,10 @@
   }
   .status .state {
     flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .meta {
     font-variant-numeric: tabular-nums;

@@ -43,6 +43,24 @@ func TestEventSequenceToSnapshot(t *testing.T) {
 	}
 }
 
+func TestLatestTodosSurviveTranscriptWindow(t *testing.T) {
+	c := New()
+	c.Handle(acpclient.Event{Kind: acpclient.EventToolCall, ToolCallID: "t1", Title: "todo",
+		ToolInput: `{"todos":[{"content":"write tests","status":"pending"}]}`})
+	for range 25 {
+		c.Handle(acpclient.Event{Kind: acpclient.EventText, Text: "filler"})
+	}
+	s := c.Snapshot()
+	if s.TodoToolID != "t1" || len(s.Todos) != 1 || s.Todos[0].Content != "write tests" {
+		t.Fatalf("todos = %q %+v", s.TodoToolID, s.Todos)
+	}
+	c.Handle(acpclient.Event{Kind: acpclient.EventToolCallUpdate, ToolCallID: "t1",
+		ToolInput: `{"todos":[{"content":"write tests","status":"completed"}]}`})
+	if got := c.Snapshot().Todos[0].Status; got != "completed" {
+		t.Fatalf("todo status = %q, want completed", got)
+	}
+}
+
 func TestReplayedToolUsesInputForTitle(t *testing.T) {
 	c := New()
 	c.Handle(acpclient.Event{Kind: acpclient.EventToolCall, ToolCallID: "t1", Title: "edit",

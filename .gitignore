@@ -2,7 +2,5 @@
 !README.md
 internal/version/version_gen.go
 dist/
-!web/dist/
-!web/dist/**
-web/node_modules/
+node_modules/
 gomaki
