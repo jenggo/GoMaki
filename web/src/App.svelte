@@ -22,12 +22,14 @@
   let theme = "light";
   let sseOpen = true;
   let snapshotError = "";
-  let sessionChoice = "";
-  let sessionTitle = "";
   let pendingUpdates = [];
   let flushScheduled = false;
   let loadingEarlier = false;
   let lastSnapshotAt = 0;
+
+  // A coarse pointer is a touch-first device: Enter inserts a newline and the
+  // send button sends.
+  const touchDevice = window.matchMedia("(pointer: coarse)").matches;
 
   function normalize(s) {
     return {
@@ -69,6 +71,7 @@
       costAmount: 0,
       costCurrency: "",
       sessionId: "",
+      title: "",
     };
   }
 
@@ -77,7 +80,6 @@
   $: dark = theme === "dark";
   $: connection = sseOpen ? "" : "Reconnecting…";
   $: todo = state.todos?.length ? { id: state.todoToolId, todos: state.todos } : null;
-  $: sessionTitle = firstPrompt(state.transcript);
   $: if (todo && todo.id !== todoToolID) {
     todoToolID = todo.id;
     todoExpanded = false;
@@ -131,6 +133,10 @@
     const close = events(applyUpdate, (open) => {
       sseOpen = open;
       if (open) refreshSnapshot();
+      else {
+        lastSnapshotAt = 0;
+        refreshSnapshot();
+      }
     });
     const poll = setInterval(() => {
       if (!sseOpen) refreshSnapshot();
@@ -159,20 +165,12 @@
     }
   }
 
-  function firstPrompt(transcript) {
-    const first = transcript.find((e) => e.kind === "user");
-    if (!first) return "";
-    const line = first.text.trim().split("\n")[0];
-    return line.length > 48 ? line.slice(0, 48) + "…" : line;
-  }
-
   function statusText() {
     if (state.busy) return state.status || "Working…";
     if (state.notice) return state.notice;
     if (state.status) return state.status;
-    if (sessionTitle) return sessionTitle;
-    if (!state.sessionId) return "No session";
-    return "Ready";
+    if (state.title) return state.title;
+    return "";
   }
 
   async function toggleTodo() {
@@ -436,8 +434,6 @@
       await refreshSnapshot();
     } catch (err) {
       error = err.message;
-    } finally {
-      sessionChoice = "";
     }
   }
 
@@ -503,10 +499,16 @@
         return;
       }
     }
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (event.key === "Enter" && !event.shiftKey && !touchDevice) {
       event.preventDefault();
       send();
     }
+  }
+
+  function jumpToBottom() {
+    if (!transcriptEl) return;
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    autoScroll = true;
   }
 
   function onScroll() {
@@ -569,15 +571,16 @@
 
   function tokens(n) {
     if (!n) return "0";
-    if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+    if (n >= 1e6) return (n / 1e6).toFixed(Number.isInteger(n / 1e6) ? 0 : 1) + "M";
+    if (n >= 1000) return (n / 1000).toFixed(Number.isInteger(n / 1000) ? 0 : 1) + "k";
     return String(n);
   }
 
-  function usage() {
-    if (!state.contextSize) return "";
+  $: usageText = (() => {
+    if (!state.contextSize) return "—/— (—%)";
     const pct = Math.round((state.contextUsed / state.contextSize) * 100);
     return `${tokens(state.contextUsed)}/${tokens(state.contextSize)} (${pct}%)`;
-  }
+  })();
 
   function cost() {
     if (!state.costAmount) return "";
@@ -604,15 +607,18 @@
             </select>
           </div>
         {:else}<span class="chip">No model</span>{/if}
-        {#if state.sessions?.length}
+        {#if state.sessionId || state.sessions?.length}
           <div class="select-wrap">
-            <select bind:value={sessionChoice} on:change={resumeSession} aria-label="Resume session">
-              <option value="">Resume…</option>
-              {#each state.sessions as session}<option value={session.id}>{session.title || session.id}</option>{/each}
+            <select value={state.sessionId || ""} on:change={resumeSession} aria-label="Session">
+              {#if !state.sessionId}<option value="">No session</option>{/if}
+              {#if state.sessionId}
+                <option value={state.sessionId}>{state.title || "New session"}</option>
+              {/if}
+              {#each (state.sessions || []).filter((x) => x.id !== state.sessionId) as session}
+                <option value={session.id}>{session.title || session.id}</option>
+              {/each}
             </select>
           </div>
-        {:else if state.sessionId}
-          <span class="chip" title={state.sessionId}>Session</span>
         {:else}<span class="chip">No session</span>{/if}
         <button
           class="theme"
@@ -639,6 +645,7 @@
     <div class="banner">{error || state.err || snapshotError}</div>
   {/if}
 
+  <div class="main-area">
   <main bind:this={transcriptEl} on:scroll={onScroll}>
     <div class="thread">
       {#if state.truncated}
@@ -692,6 +699,14 @@
       {/each}
     </div>
   </main>
+  {#if !autoScroll && state.transcript.length}
+    <button class="jump" on:click={jumpToBottom} aria-label="Scroll to bottom">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+        <path d="M12 5v14M19 12l-7 7-7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+    </button>
+  {/if}
+  </div>
 
   <div class="panels">
     {#if todo && todo.todos.length && todo.id !== todoDismissed}
@@ -770,14 +785,14 @@
             <path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
         </button>
-        {#if state.busy}
+        {#if state.busy && !draft.trim()}
           <button class="stop" on:click={stop} aria-label="Stop">
             <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false">
               <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
             </svg>
           </button>
         {:else}
-          <button class="send" on:click={send} disabled={!draft.trim()} aria-label="Send">
+          <button class="send" on:click={send} disabled={!draft.trim()} aria-label={state.busy ? "Queue prompt" : "Send"}>
             <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
               <path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
@@ -785,6 +800,7 @@
         {/if}
       </div>
       <div class="status">
+        <span class="meta usage" title="Context: used / window (percent)">{usageText}</span>
         <span class="dot" class:busy={state.busy}></span>
         <span class="state">{connection || statusText()}</span>
         <button
@@ -797,7 +813,6 @@
           <span class="mode-dot"></span>
           {modeLabel(state.mode)}
         </button>
-        <span class="meta">{usage()}</span>
         <span class="meta">{cost()}</span>
       </div>
     </div>
@@ -984,6 +999,29 @@
     -webkit-overflow-scrolling: touch;
     scrollbar-width: thin;
     scrollbar-color: var(--border) transparent;
+  }
+  .main-area {
+    position: relative;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .jump {
+    position: absolute;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 6;
+    width: 36px;
+    min-height: 36px;
+    padding: 0;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface);
+    box-shadow: var(--shadow-md);
   }
   .thread {
     max-width: 760px;
@@ -1207,6 +1245,7 @@
     border-radius: 8px;
     padding: 8px 10px;
     min-height: 0;
+    flex-shrink: 0;
   }
   .palette button.active {
     background: var(--accent-soft);
@@ -1356,6 +1395,10 @@
   .meta {
     font-variant-numeric: tabular-nums;
   }
+  .status .usage {
+    font-weight: 600;
+    color: var(--text);
+  }
 
   .modal {
     position: fixed;
@@ -1453,6 +1496,18 @@
     }
     .entry.user {
       max-width: 92%;
+    }
+    .dialog-actions {
+      justify-content: stretch;
+    }
+    .dialog-actions button {
+      flex: 1 1 100%;
+      min-height: 44px;
+    }
+    .palette button {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 2px;
     }
   }
 </style>

@@ -7,17 +7,28 @@ import (
 	"strings"
 )
 
-// customCommand is a Markdown prompt template from Maki's command folders.
-// Name is the scoped palette name, /user:name or /project:name.
+// customCommand is a slash command gomaki expands itself. Only OpenSpec
+// workflows qualify: Maki advertises its file commands, MCP prompts and
+// /compact over ACP, but commands a Lua plugin registers (opsx.lua's /opsx:*)
+// stay inside the TUI.
 type customCommand struct {
 	Name        string
 	Description string
 	Content     string
 	AcceptsArgs bool
 	InjectArgs  bool
+	Router      bool
 }
 
 func (c customCommand) render(args string) string {
+	if c.Router {
+		if args == "" {
+			args = "(ask the user what they want)"
+		}
+		// The router body is not inlined: the agent loads it, so paying for it
+		// once is enough.
+		return "Load the `openspec` skill with the `skill` tool and follow its routing steps. Request: " + args
+	}
 	if c.AcceptsArgs {
 		return strings.ReplaceAll(c.Content, "$ARGUMENTS", args)
 	}
@@ -29,121 +40,99 @@ func (c customCommand) render(args string) string {
 	return c.Content
 }
 
-// discoverCommands reads the same folders as Maki: the user's config, the
-// global Claude commands, and .maki/.claude commands from cwd up to the git
-// root. Project commands override user ones; the repo root wins over nested
-// folders, as Maki's own discovery does.
-func discoverCommands(cwd string) []customCommand {
-	home, _ := os.UserHomeDir()
-	config, _ := os.UserConfigDir()
-	return discoverCommandsIn(cwd, home, config)
+// opsxRoot is the dir name OpenSpec installs its router skill under.
+const opsxRoot = "openspec"
+
+// opsxAliases gives OpenSpec's known skill dirs their short /opsx ids. A new
+// openspec-* dir without an alias uses its name minus the prefix.
+var opsxAliases = map[string]string{
+	"openspec-explore":             "explore",
+	"openspec-propose":             "propose",
+	"openspec-new-change":          "new",
+	"openspec-continue-change":     "continue",
+	"openspec-ff-change":           "ff",
+	"openspec-update-change":       "update",
+	"openspec-apply-change":        "apply",
+	"openspec-verify-change":       "verify",
+	"openspec-sync-specs":          "sync",
+	"openspec-archive-change":      "archive",
+	"openspec-bulk-archive-change": "bulk-archive",
+	"openspec-onboard":             "onboard",
 }
 
-func discoverCommandsIn(cwd, home, config string) []customCommand {
-	byName := make(map[string]customCommand)
-	addOpsxSkills(byName, home)
-
-	addDir := func(dir string, project bool) {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			return
-		}
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
-				continue
-			}
-			cmd, ok := readCommand(filepath.Join(dir, entry.Name()), project)
-			if !ok {
-				continue
-			}
-			byName[bareName(cmd.Name)] = cmd
-		}
+// opsxCommands lists the globally installed OpenSpec skills as /opsx commands,
+// the same set opsx.lua registers: the router, then one command per
+// openspec-* skill dir. Global only, so `openspec update` is run once and every
+// project sees the same commands. A command exists only while its SKILL.md is
+// on disk.
+func opsxCommands() []customCommand {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
 	}
-
-	if config != "" {
-		addDir(filepath.Join(config, "maki", "commands"), false)
+	skills := filepath.Join(home, ".agents", "skills")
+	entries, err := os.ReadDir(skills)
+	if err != nil {
+		return nil
 	}
-	if home != "" {
-		addDir(filepath.Join(home, ".claude", "commands"), false)
-	}
-
-	dir := cwd
-	for {
-		addDir(filepath.Join(dir, ".claude", "commands"), true)
-		addDir(filepath.Join(dir, ".maki", "commands"), true)
-		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			break
+	var commands []customCommand
+	used := make(map[string]bool)
+	for _, entry := range entries {
+		cmd, ok := opsxCommand(entry.Name(), skills)
+		if !ok || used[cmd.Name] {
+			continue
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-
-	commands := make([]customCommand, 0, len(byName))
-	for _, cmd := range byName {
+		used[cmd.Name] = true
 		commands = append(commands, cmd)
 	}
-	sort.Slice(commands, func(i, j int) bool { return commands[i].Name < commands[j].Name })
+	sort.Slice(commands, func(i, j int) bool {
+		if commands[i].Router != commands[j].Router {
+			return commands[i].Router
+		}
+		return commands[i].Name < commands[j].Name
+	})
 	return commands
 }
 
-// opsxSkills maps each /opsx:<id> command to the OpenSpec skill that backs it.
-// Discovery is the same as the opsx plugin: a command exists only when its
-// SKILL.md is on disk.
-var opsxSkills = []struct{ id, skill string }{
-	{"explore", "openspec-explore"},
-	{"propose", "openspec-propose"},
-	{"apply", "openspec-apply-change"},
-	{"update", "openspec-update-change"},
-	{"sync", "openspec-sync-specs"},
-	{"archive", "openspec-archive-change"},
-	{"new", "openspec-new-change"},
-	{"continue", "openspec-continue-change"},
-	{"ff", "openspec-ff-change"},
-	{"verify", "openspec-verify-change"},
-	{"bulk-archive", "openspec-bulk-archive-change"},
-	{"onboard", "openspec-onboard"},
-}
-
-// addOpsxSkills exposes the globally installed OpenSpec skills as /opsx:<id>
-// commands. It reads the same files the opsx plugin reads and adds no state of
-// its own: no skills on disk, no commands in the palette.
-func addOpsxSkills(byName map[string]customCommand, home string) {
-	if home == "" {
-		return
-	}
-	skills := filepath.Join(home, ".agents", "skills")
-	for _, o := range opsxSkills {
-		cmd, ok := readCommand(filepath.Join(skills, o.skill, "SKILL.md"), false)
-		if !ok {
-			continue
-		}
-		cmd.Name = "/opsx:" + o.id
-		cmd.Content = "The " + o.id + " workflow skill follows.\n\n" + cmd.Content
-		cmd.AcceptsArgs = strings.Contains(cmd.Content, "$ARGUMENTS")
-		cmd.InjectArgs = !cmd.AcceptsArgs
-		byName[bareName(cmd.Name)] = cmd
-	}
-}
-
-func bareName(display string) string {
-	if _, bare, ok := strings.Cut(display, ":"); ok {
-		return bare
-	}
-	return display
-}
-
-func readCommand(path string, project bool) (customCommand, bool) {
-	blob, err := os.ReadFile(path)
-	if err != nil {
+// opsxCommand turns one skill dir into its /opsx command.
+func opsxCommand(dir, skills string) (customCommand, bool) {
+	if !strings.HasPrefix(dir, opsxRoot) {
 		return customCommand{}, false
 	}
+	name, description, content, ok := readSkill(filepath.Join(skills, dir, "SKILL.md"))
+	if !ok {
+		return customCommand{}, false
+	}
+	if dir == opsxRoot || name == opsxRoot {
+		return customCommand{Name: "/opsx", Description: description, Router: true}, true
+	}
+	id := opsxAliases[dir]
+	if id == "" {
+		id = strings.TrimPrefix(dir, opsxRoot+"-")
+	}
+	if id == "" {
+		return customCommand{}, false
+	}
+	acceptsArgs := strings.Contains(content, "$ARGUMENTS")
+	return customCommand{
+		Name:        "/opsx:" + id,
+		Description: description,
+		Content:     "The " + id + " workflow skill follows.\n\n" + content,
+		AcceptsArgs: acceptsArgs,
+		InjectArgs:  !acceptsArgs,
+	}, true
+}
+
+// readSkill reads a SKILL.md: its frontmatter name and description, and the
+// body with the frontmatter removed. The dir name stands in for a missing name.
+func readSkill(path string) (name, description, body string, ok bool) {
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", "", false
+	}
 	content := strings.TrimSpace(string(blob))
-	name, description := "", ""
 	if rest, ok := strings.CutPrefix(content, "---"); ok {
-		if fm, body, ok := strings.Cut(rest, "\n---"); ok {
+		if fm, text, ok := strings.Cut(rest, "\n---"); ok {
 			for line := range strings.SplitSeq(fm, "\n") {
 				key, value, ok := strings.Cut(line, ":")
 				if !ok {
@@ -157,30 +146,20 @@ func readCommand(path string, project bool) (customCommand, bool) {
 					description = value
 				}
 			}
-			content = strings.TrimSpace(body)
+			content = strings.TrimSpace(text)
 		}
 	}
 	if content == "" {
-		return customCommand{}, false
+		return "", "", "", false
 	}
 	if name == "" {
-		name = strings.TrimSuffix(filepath.Base(path), ".md")
+		name = filepath.Base(filepath.Dir(path))
 	}
-	scope := "/user:"
-	if project {
-		scope = "/project:"
-	}
-	return customCommand{
-		Name:        scope + name,
-		Description: description,
-		Content:     content,
-		AcceptsArgs: strings.Contains(content, "$ARGUMENTS"),
-	}, true
+	return name, description, content, true
 }
 
 func (a *app) loadCommands() {
-	a.commands = discoverCommands(a.cwd)
-	a.commandsCwd = a.cwd
+	a.commands = opsxCommands()
 }
 
 func (a *app) commandMatches() []customCommand {

@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"maps"
 	"math"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,9 +20,6 @@ import (
 func (a *app) view(c *ui.Context) {
 	a.mirror()
 	a.syncTodo()
-	if a.commandsCwd != a.cwd {
-		a.loadCommands()
-	}
 	c.SetTheme(a.windowTheme(c))
 	t := c.Theme()
 	if a.copyPending != "" {
@@ -328,15 +327,17 @@ func (a *app) entryView(c *ui.Context, col ui.Element, e *entry, t *ui.Theme, st
 				ui.Text(c, chevron(expanded)).FontSize(t.Rem(0.8)).TextColor(t.TextMuted).IgnoreInput(true)
 				ui.Text(c, "Thinking").Bold().FontSize(t.Rem(0.85)).TextColor(t.TextMuted).IgnoreInput(true)
 			})
-			text := e.Text
-			if !expanded {
-				text = thoughtPreview(text)
+			switch {
+			case expanded:
+				a.copyable(c, col, ui.Text(c, e.Text).FontSize(t.Rem(0.9)).TextColor(t.TextMuted))
+			case streaming:
+				// The live thought rolls: new lines come in at the bottom and
+				// push the oldest out of the top, as end credits do.
+				a.thoughtRoll(c, col, e.Text, t)
+			default:
+				a.copyable(c, col, ui.Text(c, thoughtPreview(e.Text)).FontSize(t.Rem(0.9)).
+					TextColor(t.TextMuted).MaxLines(thoughtLines))
 			}
-			body := ui.Text(c, text).FontSize(t.Rem(0.9)).TextColor(t.TextMuted)
-			if !expanded {
-				body = body.MaxLines(5)
-			}
-			a.copyable(c, col, body)
 		})
 	case entryTool:
 		a.toolEntry(c, col, e, t)
@@ -456,6 +457,24 @@ func (a *app) transcriptText() string {
 	return strings.TrimSpace(b.String())
 }
 
+// thoughtLines is how much of a thought stays in view while it streams.
+const thoughtLines = 5
+
+// thoughtRoll shows the end of a live thought in a box that follows it: new
+// lines come in at the bottom and push the oldest out of the top, as end
+// credits do.
+func (a *app) thoughtRoll(c *ui.Context, col ui.Element, text string, t *ui.Theme) {
+	font := t.Rem(0.9)
+	line := font * 1.35
+	if a.thoughtScroll.Y >= a.thoughtScroll.MaxY {
+		a.thoughtScroll.Y = math.MaxFloat32
+	}
+	a.copyable(c, col, ui.Scroll(c).TrackScroll(&a.thoughtScroll).Scrollbars(false).
+		MaxHeight(line*thoughtLines).Children(func() {
+		ui.Text(c, text).FontSize(font).FixedLineHeight(line).TextColor(t.TextMuted)
+	}))
+}
+
 func thoughtPreview(text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -463,8 +482,8 @@ func thoughtPreview(text string) string {
 	}
 	truncated := false
 	lines := strings.Split(text, "\n")
-	if len(lines) > 5 {
-		lines = lines[len(lines)-5:]
+	if len(lines) > thoughtLines {
+		lines = lines[len(lines)-thoughtLines:]
 		truncated = true
 	}
 	text = strings.Join(lines, "\n")
@@ -506,6 +525,7 @@ func chevron(expanded bool) string {
 }
 
 func (a *app) toolBlock(c *ui.Context, col ui.Element, label, text string, t *ui.Theme) {
+	text = toolText(text)
 	ui.Column(c).Gap(2).Children(func() {
 		ui.Text(c, label).FontSize(t.Rem(0.75)).Bold().TextColor(t.TextMuted)
 		if len(text) > toolHighlightLimit {
@@ -514,6 +534,40 @@ func (a *app) toolBlock(c *ui.Context, col ui.Element, label, text string, t *ui
 		}
 		markdown.View(c, codeFence(text), &a.toolMD)
 	})
+}
+
+// toolText decodes what maki hands over for display: the tool input arrives
+// as a JSON object and outputs often arrive JSON-quoted.
+func toolText(raw string) string {
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return raw
+	}
+	switch val := v.(type) {
+	case string:
+		return val
+	case map[string]any:
+		var b strings.Builder
+		for i, k := range slices.Sorted(maps.Keys(val)) {
+			if i > 0 {
+				b.WriteString("\n\n")
+			}
+			b.WriteString(k)
+			b.WriteString(": ")
+			if s, ok := val[k].(string); ok {
+				b.WriteString(s)
+			} else {
+				enc, err := json.MarshalIndent(val[k], "", "  ")
+				if err != nil {
+					return raw
+				}
+				b.Write(enc)
+			}
+		}
+		return b.String()
+	default:
+		return raw
+	}
 }
 
 // toolHighlightLimit keeps large tool outputs plain: highlighting them costs

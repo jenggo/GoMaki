@@ -51,8 +51,9 @@ type entry struct {
 }
 
 type app struct {
-	scroll ui.ScrollState
-	escAt  time.Time
+	scroll        ui.ScrollState
+	thoughtScroll ui.ScrollState
+	escAt         time.Time
 
 	win  *mygo.Window
 	core *session.Core
@@ -70,8 +71,7 @@ type app struct {
 	md     markdown.Options
 	toolMD markdown.Options
 
-	notice      string
-	commandsCwd string
+	notice string
 
 	cwd       string
 	branch    string
@@ -84,6 +84,7 @@ type app struct {
 
 	model     string
 	mode      string
+	title     string
 	resumeErr string
 
 	costCurrency string
@@ -171,6 +172,7 @@ func (a *app) startup() {
 			a.core = core
 			a.connected = true
 			a.status = ""
+			a.loadCommands()
 			a.syncMenu()
 			if a.continueLast {
 				a.resumeLast()
@@ -208,7 +210,10 @@ func (a *app) watch(core *session.Core) {
 func (a *app) handleUpdate(u session.Update) {
 	switch u.Kind {
 	case session.UpdateReset:
-		a.win.Update(a.clearUI)
+		a.win.Update(func() {
+			a.clearUI()
+			a.syncTitle("")
+		})
 	case session.UpdateRestoreDraft:
 		a.win.Update(func() { a.prompt = u.Text })
 	case session.UpdateEvent:
@@ -219,6 +224,7 @@ func (a *app) handleUpdate(u session.Update) {
 			a.modes = u.State.Modes
 			a.model = u.State.Model
 			a.mode = u.State.Mode
+			a.syncTitle(u.State.Title)
 			if u.State.Err != "" {
 				a.err = u.State.Err
 			}
@@ -279,6 +285,7 @@ func (a *app) clearUI() {
 	a.notice = ""
 	a.escAt = time.Time{}
 	a.scroll = ui.ScrollState{}
+	a.thoughtScroll = ui.ScrollState{}
 	a.sessionPick = -1
 	a.paletteIndex = 0
 	a.planExpanded = false
@@ -476,6 +483,20 @@ func (a *app) notify(title, body string) {
 	go func() {
 		_ = mygo.NewNotification(mygo.NotificationOptions{Title: title, Body: body}).Show()
 	}()
+}
+
+// syncTitle puts the session title in the window title bar. Call it on the
+// main thread; it skips the native call when nothing changed.
+func (a *app) syncTitle(title string) {
+	if title == a.title || a.win == nil {
+		return
+	}
+	a.title = title
+	if title == "" {
+		a.win.SetTitle(appName)
+		return
+	}
+	a.win.SetTitle(appName + " (" + title + ")")
 }
 
 // runningTools returns the transcript indexes of tool calls still running.

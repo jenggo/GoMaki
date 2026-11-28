@@ -4,15 +4,20 @@
 package session
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"gomaki/internal/acpclient"
 )
@@ -74,6 +79,7 @@ type State struct {
 	SessionID  string
 	Cwd        string
 	Branch     string
+	Title      string
 	Transcript []Entry
 	Plan       []acpclient.PlanEntry
 	Todos      []acpclient.PlanEntry
@@ -121,13 +127,17 @@ type Update struct {
 
 // Core owns the ACP client and the session state.
 type Core struct {
-	client  *acpclient.Client
-	stop    chan struct{}
-	subs    []chan Update
-	state   State
-	mu      sync.Mutex
-	closed  bool
-	loading bool
+	client *acpclient.Client
+	stop   chan struct{}
+
+	// titleSource is the first prompt the model saw, which is the text maki
+	// names a session after. The transcript holds what the user typed instead.
+	titleSource string
+	subs        []chan Update
+	state       State
+	mu          sync.Mutex
+	closed      bool
+	loading     bool
 }
 
 // New returns a core with no agent process. Call Start to spawn one.
@@ -444,6 +454,7 @@ func (c *Core) LoadSession(id string) error {
 	c.mu.Lock()
 	client := c.client
 	cwd := c.state.Cwd
+	contextSize := c.state.ContextSize
 	if client == nil {
 		c.mu.Unlock()
 		return errors.New("no agent")
@@ -464,9 +475,83 @@ func (c *Core) LoadSession(id string) error {
 		return err
 	}
 	c.state.Resumed = true
+	used, model := storedContext(id)
+	window := catalogWindow(model)
+	if window == 0 {
+		window = contextSize
+	}
+	c.state.ContextUsed, c.state.ContextSize = used, window
 	c.applySessionLocked(s)
 	c.publishLocked(Update{Kind: UpdateState})
 	return nil
+}
+
+// storedContext reads the gauge and the model from maki's session file. ACP
+// sends a usage update only when a turn finishes, so a resumed session has
+// none.
+func storedContext(id string) (used int64, model string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0, ""
+	}
+	f, err := os.Open(filepath.Join(home, ".local", "state", "maki", "sessions", id+".jsonl"))
+	if err != nil {
+		return 0, ""
+	}
+	defer func() { _ = f.Close() }()
+
+	reader := bufio.NewReader(f)
+	metaPrefix := []byte(`{"t":"meta"`)
+	headerPrefix := []byte(`{"t":"header"`)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if bytes.HasPrefix(line, metaPrefix) {
+			var meta struct {
+				ContextSize int64 `json:"context_size"`
+			}
+			if json.Unmarshal(line, &meta) == nil {
+				used = meta.ContextSize
+			}
+		} else if bytes.HasPrefix(line, headerPrefix) {
+			var header struct {
+				Model string `json:"model"`
+			}
+			if json.Unmarshal(line, &header) == nil {
+				model = header.Model
+			}
+		}
+		if err != nil {
+			return used, model
+		}
+	}
+}
+
+// catalogWindow looks up the model's context window in maki's cached
+// models.dev catalog. Zero means unknown; the caller keeps what it has.
+func catalogWindow(model string) int64 {
+	provider, id, ok := strings.Cut(model, "/")
+	if !ok {
+		return 0
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".cache", "maki", "models-dev-catalog.json"))
+	if err != nil {
+		return 0
+	}
+	var catalog map[string]struct {
+		Models map[string]struct {
+			Limit struct {
+				Context int64 `json:"context"`
+			} `json:"limit"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(data, &catalog) != nil {
+		return 0
+	}
+	return catalog[provider].Models[id].Limit.Context
 }
 
 // ListSessions lists stored sessions for the working directory.
@@ -625,6 +710,7 @@ func (c *Core) snapshotLocked() State {
 	}
 	s.Plan = slices.Clone(c.state.Plan)
 	s.Todos = slices.Clone(c.state.Todos)
+	s.Title = c.titleLocked()
 	s.Models = slices.Clone(c.state.Models)
 	s.Modes = slices.Clone(c.state.Modes)
 	s.Sessions = slices.Clone(c.state.Sessions)
@@ -632,12 +718,53 @@ func (c *Core) snapshotLocked() State {
 	return s
 }
 
+// titleLocked derives the session title from the first prompt the model saw,
+// the same text maki stores in session/list, so the label does not change once
+// the session is saved.
+func (c *Core) titleLocked() string {
+	if c.titleSource != "" {
+		return titleText(c.titleSource)
+	}
+	return titleFrom(c.state.Transcript)
+}
+
+// titleLimit is maki's session title cap, in bytes.
+const titleLimit = 60
+
+// titleFrom names a session the way maki does: the first user prompt,
+// whitespace collapsed, cut at titleLimit bytes.
+func titleFrom(transcript []Entry) string {
+	for _, e := range transcript {
+		if e.Kind == EntryUser {
+			return titleText(e.Text)
+		}
+	}
+	return ""
+}
+
+func titleText(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) <= titleLimit {
+		return text
+	}
+	cut := text[:titleLimit]
+	for !utf8.RuneStart(text[len(cut)]) {
+		cut = cut[:len(cut)-1]
+	}
+	if i := strings.LastIndexByte(cut, ' '); i > titleLimit/2 {
+		cut = cut[:i]
+	}
+	return cut + "…"
+}
 func (c *Core) sendLocked(prompt, display string, att *acpclient.Attachment) bool {
 	s := &c.state
 	s.Err = ""
 	s.Notice = ""
 	s.PlanReady = false
 	mark := len(s.Transcript)
+	if c.titleSource == "" {
+		c.titleSource = prompt
+	}
 	s.Transcript = append(s.Transcript, Entry{Kind: EntryUser, Text: display})
 	s.Busy = true
 	s.Status = "Working…"
@@ -896,6 +1023,7 @@ func (c *Core) askElicitationLocked(req *acpclient.ElicitationRequest) {
 
 func (c *Core) resetLocked() {
 	s := &c.state
+	c.titleSource = ""
 	s.Transcript = nil
 	s.Plan = nil
 	s.Todos = nil

@@ -21,42 +21,29 @@ func writeCommand(t *testing.T, path, body string) {
 	}
 }
 
-func TestDiscoverCommands(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeCommand(t, filepath.Join(dir, ".maki", "commands", "foo.md"), "---\nname: foo\ndescription: Foo command\n---\nDo $ARGUMENTS now.\n")
-
-	cmds := discoverCommandsIn(dir, "", "")
-	if len(cmds) != 1 {
-		t.Fatalf("commands = %+v", cmds)
-	}
-	cmd := cmds[0]
-	if cmd.Name != "/project:foo" || cmd.Description != "Foo command" {
-		t.Fatalf("command = %+v", cmd)
-	}
-	if !cmd.AcceptsArgs || cmd.render("bar") != "Do bar now." {
-		t.Fatalf("render = %q", cmd.render("bar"))
-	}
-}
-
-func TestDiscoverOpsxSkills(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	home := filepath.Join(dir, "home")
+func TestOpsxCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	skills := filepath.Join(home, ".agents", "skills")
+	writeCommand(t, filepath.Join(skills, "openspec", "SKILL.md"),
+		"---\nname: openspec\ndescription: Route OpenSpec work\n---\nRouter body.\n")
 	writeCommand(t, filepath.Join(skills, "openspec-propose", "SKILL.md"),
 		"---\nname: openspec-propose\ndescription: Propose a change\n---\nPropose body.\n")
-	writeCommand(t, filepath.Join(skills, "openspec-ff-change", "SKILL.md"),
-		"---\nname: openspec-ff-change\ndescription: Fast forward\n---\nFF body with $ARGUMENTS.\n")
+	writeCommand(t, filepath.Join(skills, "openspec-fix-thing", "SKILL.md"),
+		"---\nname: openspec-fix-thing\ndescription: Fix a thing\n---\nFix body with $ARGUMENTS.\n")
 
-	cmds := discoverCommandsIn(dir, home, "")
-	if len(cmds) != 2 {
+	cmds := opsxCommands()
+	if len(cmds) != 3 {
 		t.Fatalf("commands = %+v", cmds)
 	}
+	if cmds[0].Name != "/opsx" || !cmds[0].Router || cmds[0].Description != "Route OpenSpec work" {
+		t.Fatalf("router = %+v", cmds[0])
+	}
+	if got := cmds[0].render("where do things stand"); got !=
+		"Load the `openspec` skill with the `skill` tool and follow its routing steps. Request: where do things stand" {
+		t.Fatalf("router render = %q", got)
+	}
+
 	byName := make(map[string]customCommand)
 	for _, cmd := range cmds {
 		byName[cmd.Name] = cmd
@@ -66,34 +53,16 @@ func TestDiscoverOpsxSkills(t *testing.T) {
 	if !ok || propose.Description != "Propose a change" {
 		t.Fatalf("propose = %+v", propose)
 	}
-	if got := propose.render(""); got != "The propose workflow skill follows.\n\nPropose body." {
-		t.Fatalf("render without args = %q", got)
-	}
 	if got := propose.render("my-change"); !strings.Contains(got, "**Provided arguments**: my-change") {
 		t.Fatalf("render with args = %q", got)
 	}
 
-	ff, ok := byName["/opsx:ff"]
-	if !ok || !ff.AcceptsArgs {
-		t.Fatalf("ff = %+v", ff)
+	custom, ok := byName["/opsx:fix-thing"]
+	if !ok || !custom.AcceptsArgs {
+		t.Fatalf("custom = %+v", custom)
 	}
-	if got := ff.render("abc"); got != "The ff workflow skill follows.\n\nFF body with abc." {
-		t.Fatalf("ff render = %q", got)
-	}
-}
-
-func TestProjectCommandOverridesUser(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	config := filepath.Join(dir, "config")
-	writeCommand(t, filepath.Join(config, "maki", "commands", "foo.md"), "user body\n")
-	writeCommand(t, filepath.Join(dir, ".maki", "commands", "foo.md"), "project body\n")
-
-	cmds := discoverCommandsIn(dir, "", config)
-	if len(cmds) != 1 || cmds[0].Content != "project body" || cmds[0].Name != "/project:foo" {
-		t.Fatalf("commands = %+v", cmds)
+	if got := custom.render("abc"); got != "The fix-thing workflow skill follows.\n\nFix body with abc." {
+		t.Fatalf("custom render = %q", got)
 	}
 }
 
@@ -101,24 +70,23 @@ func TestCommandPalette(t *testing.T) {
 	a := newTestApp()
 	a.connected = true
 	a.cwd = "/test"
-	a.commandsCwd = "/test"
-	a.commands = []customCommand{{Name: "/project:foo", Description: "Foo command"}}
+	a.commands = []customCommand{{Name: "/opsx:foo", Description: "Foo command"}}
 	a.prompt = "/"
 	tt := ui.NewTester(a.view, 1000, 720)
-	if !tt.HasText("/project:foo") || !tt.HasText("Foo command") {
+	if !tt.HasText("/opsx:foo") || !tt.HasText("Foo command") {
 		t.Fatalf("palette missing: %q", tt.Texts())
 	}
-	r, ok := tt.Find("/project:foo")
+	r, ok := tt.Find("/opsx:foo")
 	if !ok {
 		t.Fatal("command not found in palette")
 	}
 	tt.ClickAt(r.X+r.W/2, r.Y+r.H/2)
-	if a.prompt != "/project:foo " {
+	if a.prompt != "/opsx:foo " {
 		t.Fatalf("prompt = %q", a.prompt)
 	}
 	tt.Frame()
 	tt.Type("x")
-	if a.prompt != "/project:foo x" {
+	if a.prompt != "/opsx:foo x" {
 		t.Fatalf("composer text = %q", a.prompt)
 	}
 }

@@ -16,6 +16,10 @@ export function events(onUpdate, onStatus) {
 
 export async function snapshot() {
   const res = await fetch("/snapshot");
+  if (res.status === 401) {
+    window.location.replace("/login");
+    throw new Error("unauthorized");
+  }
   if (!res.ok) throw new Error(`snapshot ${res.status}`);
   return res.json();
 }
@@ -26,6 +30,10 @@ export async function post(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
   });
+  if (res.status === 401) {
+    window.location.replace("/login");
+    throw new Error("unauthorized");
+  }
   if (!res.ok) throw new Error((await res.text()).trim() || "request failed");
   return res.json();
 }

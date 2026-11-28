@@ -6,6 +6,33 @@
   export let details = null;
 
   const dispatch = createEventDispatcher();
+
+  // The server stores the tool input as JSON and outputs often arrive
+  // JSON-quoted, so decode before showing them.
+  function formatInput(raw) {
+    try {
+      const v = JSON.parse(raw);
+      if (v && typeof v === "object") {
+        return Object.entries(v)
+          .map(([k, val]) => (typeof val === "string" ? `${k}: ${val}` : `${k}: ${JSON.stringify(val, null, 2)}`))
+          .join("\n\n");
+      }
+      return typeof v === "string" ? v : raw;
+    } catch {
+      return raw;
+    }
+  }
+
+  function formatOutput(raw) {
+    try {
+      const v = JSON.parse(raw);
+      if (typeof v === "string") return v;
+      if (v && typeof v === "object") return JSON.stringify(v, null, 2);
+    } catch {
+      // Plain text output is shown as is.
+    }
+    return raw;
+  }
 </script>
 
 <div class="tool">
@@ -31,11 +58,11 @@
       {#if details}
         {#if details.input}
           <div class="label">Input</div>
-          <pre>{details.input}</pre>
+          <pre>{formatInput(details.input)}</pre>
         {/if}
         {#if details.output}
           <div class="label">Output</div>
-          <pre>{details.output}</pre>
+          <pre>{formatOutput(details.output)}</pre>
         {/if}
         {#if details.truncated}
           <p class="truncated">Output truncated.</p>

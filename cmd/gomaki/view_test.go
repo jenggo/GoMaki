@@ -632,10 +632,9 @@ func TestCommandPaletteKeyboard(t *testing.T) {
 	a := newTestApp()
 	a.connected = true
 	a.cwd = "/test"
-	a.commandsCwd = "/test"
 	a.commands = []customCommand{
-		{Name: "/project:alpha", Description: "Alpha"},
-		{Name: "/project:beta", Description: "Beta"},
+		{Name: "/opsx:alpha", Description: "Alpha"},
+		{Name: "/opsx:beta", Description: "Beta"},
 	}
 	tt := ui.NewTester(a.view, 1000, 720)
 	tt.Frame()
@@ -650,7 +649,7 @@ func TestCommandPaletteKeyboard(t *testing.T) {
 	}
 	tt.Key(0, ui.KeyEnter)
 	tt.Frame()
-	if a.prompt != "/project:beta " {
+	if a.prompt != "/opsx:beta " {
 		t.Fatalf("prompt after Enter = %q", a.prompt)
 	}
 }
@@ -710,5 +709,37 @@ func TestTodoPanelClosesWhenDone(t *testing.T) {
 	tt.Frame()
 	if tt.HasText("Tasks 2 of 2") {
 		t.Fatalf("todo panel did not close: %q", tt.Texts())
+	}
+}
+
+func TestStreamingThoughtRolls(t *testing.T) {
+	a := newTestApp()
+	a.busy = true
+	line := "a line of reasoning\n"
+	text := strings.Repeat(line, thoughtLines-1) + strings.TrimSpace(line)
+	a.transcript = []entry{{Kind: entryThought, Text: text}}
+	tt := ui.NewTester(a.view, 900, 700)
+	tt.Frame()
+	if a.thoughtScroll.MaxY != 0 {
+		t.Fatalf("%d lines should fit the box, maxY = %v", thoughtLines, a.thoughtScroll.MaxY)
+	}
+
+	a.transcript[0].Text = strings.Repeat("a line of reasoning\n", 40)
+	tt.Frame()
+	if a.thoughtScroll.MaxY <= 0 {
+		t.Fatalf("thought box does not scroll: maxY = %v", a.thoughtScroll.MaxY)
+	}
+	if a.thoughtScroll.Y < a.thoughtScroll.MaxY {
+		t.Fatalf("thought box does not follow its end: y = %v, maxY = %v", a.thoughtScroll.Y, a.thoughtScroll.MaxY)
+	}
+
+	row, ok := tt.Find("Thinking")
+	if !ok {
+		t.Fatal("thinking header missing")
+	}
+	tt.ClickAt(row.X+row.W/2, row.Y+row.H/2)
+	tt.Frame()
+	if !a.transcript[0].Expanded {
+		t.Fatal("clicking the header no longer expands the thought")
 	}
 }

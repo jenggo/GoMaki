@@ -2,6 +2,9 @@ package session
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -522,5 +525,77 @@ func TestApplyingSessionDropsItFromSessionList(t *testing.T) {
 	sessions := c.Snapshot().Sessions
 	if len(sessions) != 1 || sessions[0].ID != "s2" {
 		t.Fatalf("session list = %+v", sessions)
+	}
+}
+
+func TestStoredContext(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	sessions := filepath.Join(dir, ".local", "state", "maki", "sessions")
+	if err := os.MkdirAll(sessions, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"t":"header","id":"s1","model":"kenari/hy4-flash"}
+{"t":"meta","context_size":1000}
+{"t":"msg","d":{}}
+{"t":"meta","context_size":4300}
+`
+	if err := os.WriteFile(filepath.Join(sessions, "s1.jsonl"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	used, model := storedContext("s1")
+	if used != 4300 || model != "kenari/hy4-flash" {
+		t.Fatalf("storedContext = %d, %q, want 4300, kenari/hy4-flash", used, model)
+	}
+	if used, model = storedContext("missing"); used != 0 || model != "" {
+		t.Fatalf("missing session = %d, %q, want 0, \"\"", used, model)
+	}
+}
+
+func TestCatalogWindow(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	cache := filepath.Join(dir, ".cache", "maki")
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	catalog := `{"kenari":{"models":{"hy4-flash":{"limit":{"context":1048576}}}}}`
+	if err := os.WriteFile(filepath.Join(cache, "models-dev-catalog.json"), []byte(catalog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := catalogWindow("kenari/hy4-flash"); got != 1048576 {
+		t.Fatalf("catalogWindow = %d, want 1048576", got)
+	}
+	if got := catalogWindow("kenari/unknown"); got != 0 {
+		t.Fatalf("unknown model = %d, want 0", got)
+	}
+	if got := catalogWindow("no-slash"); got != 0 {
+		t.Fatalf("malformed spec = %d, want 0", got)
+	}
+}
+
+func TestTitleText(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"fix the\n\n  bug\tnow", "fix the bug now"},
+		{"", ""},
+		{"short", "short"},
+		{strings.Repeat("a", 70), strings.Repeat("a", 60) + "…"},
+		{"alpha beta gamma delta epsilon zeta eta theta iota kappa",
+			"alpha beta gamma delta epsilon zeta eta theta iota kappa"},
+		{"alpha beta gamma delta epsilon zeta eta theta iota kappa lambda",
+			"alpha beta gamma delta epsilon zeta eta theta iota kappa…"},
+	}
+	for _, c := range cases {
+		if got := titleText(c.in); got != c.want {
+			t.Errorf("titleText(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSnapshotTitle(t *testing.T) {
+	c := New()
+	c.state.Transcript = []Entry{{Kind: EntryAgent, Text: "hello"}, {Kind: EntryUser, Text: "do\nit"}}
+	if got := c.Snapshot().Title; got != "do it" {
+		t.Fatalf("title = %q", got)
 	}
 }

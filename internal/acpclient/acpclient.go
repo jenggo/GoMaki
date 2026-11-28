@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -154,6 +155,7 @@ type Attachment struct {
 // Client spawns `maki acp` and speaks ACP to it.
 type Client struct {
 	cmd          *exec.Cmd
+	stdin        io.WriteCloser
 	conn         *acp.ClientSideConnection
 	events       chan Event
 	wake         chan struct{}
@@ -181,6 +183,7 @@ func Start(dir string) (*Client, error) {
 
 	c := &Client{
 		cmd:     cmd,
+		stdin:   stdin,
 		events:  make(chan Event, 512),
 		wake:    make(chan struct{}, 1),
 		modelID: modelConfigID,
@@ -211,12 +214,31 @@ func (c *Client) Events() <-chan Event { return c.events }
 // so one goroutine can ask for a frame while another drains the updates.
 func (c *Client) Wake() <-chan struct{} { return c.wake }
 
-// Close stops the agent process.
+// closeGrace is how long Close waits for the agent to exit after its stdin
+// ends. Maki saves the running session on shutdown, even mid-turn, so the
+// wait is what keeps a force-exited turn from being lost.
+const closeGrace = 5 * time.Second
+
+// Close ends the agent. Closing stdin lets the agent save the session before
+// it exits; an agent still running after the grace is killed.
 func (c *Client) Close() error {
 	if c.cmd.Process == nil {
 		return nil
 	}
-	return c.cmd.Process.Kill()
+	_ = c.stdin.Close()
+	done := make(chan struct{})
+	go func() {
+		_, _ = c.cmd.Process.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(closeGrace):
+		_ = c.cmd.Process.Kill()
+		<-done
+		return nil
+	}
 }
 
 // SupportsImages reports whether the agent takes images in a prompt.

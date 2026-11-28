@@ -9,18 +9,18 @@ Maki still does the work. GoMaki is a front end: sessions, prompts, tool calls, 
 - A single-window chat view with streaming agent text, thoughts, and tool calls.
 - A task panel above the composer: it summarizes progress and expands to the full list.
 - A running-tasks window (Cmd+Shift+B, or click `N running` in the status bar) for tool calls still in progress, including delegated agents.
-- Click a tool call to expand its raw input and output.
-- Thoughts stay collapsed to their last five lines. Click the header to read the whole thing.
+- Click a tool call to expand its input and output. JSON values are decoded into readable text.
+- Idle thoughts show their last five lines. A streaming thought rolls in a fixed-height box that follows the newest lines; click the header to read the whole thing.
 - A session picker on first open. Click a stored session to continue it, or type a prompt to start a new one.
 - A model menu. The list fills in as providers answer.
 - Build and plan modes. Click the mode in the status bar to switch.
 - Permission dialogs for tool calls, and native forms for Maki's `question` tool.
 - Notifications while the window is in the background: a permission request, or a finished turn.
 - Attach an image or file to the next prompt (File > Attach Image or File…, or Cmd+Shift+A).
-- Token usage in the status bar (`27.4k/200k (14%)`), with cost when Maki reports it.
-- The status bar shows the workspace folder and its Git branch (`project (main)`), plus an icon for ready or working.
+- Token usage in the status bar (`27.4k/200k (14%)`), with cost when Maki reports it. A resumed session restores the gauge from Maki's saved state.
+- The status bar shows the workspace folder and its Git branch (`project (main)`), plus an icon for ready or working. The window title shows the session name.
 - Light and dark themes, a system theme, and a monospace-only font picker with font sizes.
-- Custom slash commands from your user and project command folders, plus the commands Maki announces over ACP.
+- OpenSpec `/opsx` commands built from the globally installed skills, plus the commands Maki announces over ACP.
 - Copy from the transcript with right-click, or with Ctrl+C after selecting text.
 - Reload the app from File > Reload (Cmd+R) or `/reload`, resuming the current session.
 
@@ -75,11 +75,13 @@ Use the same session from a phone or tablet:
 ./gomaki -p 'your-password'
 ```
 
-Passing `-p` (or `--password`) starts HTTP Mode with the app, so the window shows the reachable URL(s) and a Cancel button. The server binds `0.0.0.0`; add `-l <addr>` (or `--listen`) to restrict the interface and `-P <n>` (or `--port`) to choose a port.
+Passing `-p` (or `--password`) starts HTTP Mode headless, with no desktop window. It prints the reachable URL(s) and waits in the terminal. Press `D` to shut the server down and open the desktop app in the same folder, or Ctrl+C to quit. The server binds `0.0.0.0`; add `-l <addr>` (or `--listen`) to restrict the interface and `-P <n>` (or `--port`) to choose a port.
 
-Without `-p`, File > HTTP Mode still works: it binds `127.0.0.1` only and skips the login page. It does not prompt for a password before starting. That mode serves plain HTTP, because browsers treat loopback as a secure context, so there is no certificate warning to accept.
+With `-p` the server uses TLS and a login page. The certificate is self-signed and generated on first use; accept the browser warning once per device. If the login cookie expires, the web UI returns to `/login`.
 
-With `-p` the server uses TLS. The certificate is self-signed and generated on first use. Accept the browser warning once per device. The web UI follows the system light/dark preference and has a toggle in the header.
+Without `-p`, File > HTTP Mode still works in the desktop app: it binds `127.0.0.1` only, skips the login page, and shows the URL(s) with a Cancel button. It serves plain HTTP, because browsers treat loopback as a secure context, so there is no certificate warning to accept.
+
+The web view has a session picker showing the current session name, a jump-to-bottom button, and a context gauge in the status bar. While a turn is running, the send button queues the next prompt. On touch devices Enter inserts a newline and the send button sends. The UI follows the system light/dark preference and has a toggle in the header.
 
 ## First open
 
@@ -110,21 +112,15 @@ If `maki` is missing, the window stays open and shows the error at the top. Inst
 
 Esc twice on an empty composer removes the transcript from the last user message onward and puts that message back in the composer. This is a UI rewind. ACP has no history rewind, so Maki's own context still contains the turn you removed.
 
-## Custom commands
+## Slash commands
 
-GoMaki reads the same command folders as Maki:
+GoMaki builds its own command list from the globally installed OpenSpec skills. Everything else in the palette comes from Maki over ACP.
 
-- `~/.config/maki/commands/`
-- `~/.claude/commands/`
-- `.maki/commands/` and `.claude/commands/` from the working directory up to the Git root
-
-Commands are Markdown files. Frontmatter can set `name` and `description`. `$ARGUMENTS` in the body is replaced with what you type after the command. Project commands override user commands, and the repo root wins over nested folders.
-
-Type `/` in the composer and pick one. If you add a file while GoMaki is running, use File > Reload Commands. The transcript shows the command line; GoMaki expands local commands before sending, while commands Maki announced are sent as typed.
+Type `/` in the composer and pick one. GoMaki expands its own commands before sending; commands Maki announced are sent as typed. File > Reload Commands refreshes the OpenSpec list after installing or updating the skills.
 
 ### What Maki sends over ACP
 
-Maki announces its slash commands over ACP as an `available_commands_update` on every new and resumed session. This starts in Maki 0.7.3; earlier releases send no command list. GoMaki merges that list into the `/` palette with a leading `/`, after its own local commands. Selecting one sends the command line unchanged: Maki expands the template on its side.
+Maki announces its slash commands over ACP as an `available_commands_update` on every new and resumed session. This starts in Maki 0.7.3; earlier releases send no command list. GoMaki merges that list into the `/` palette with a leading `/`, after its OpenSpec commands. Selecting one sends the command line unchanged: Maki expands the template on its side.
 
 Transferred over ACP:
 
@@ -138,23 +134,24 @@ Not transferred over ACP:
 - **Plugin commands registered from Lua** with `maki.api.register_command`. They run inside Maki's own TUI and never reach an ACP client. This covers all twelve `/opsx:*` commands and any other plugin command.
 - Maki's other TUI built-ins: `/help`, `/model`, `/theme`, `/sessions`, `/reload`, and so on. Use GoMaki's model menu, the mode in the status bar, the session picker, and File > Reload instead.
 
-GoMaki works around the plugin gap only where it can do so from the same files the plugin reads. `/opsx:*` is rebuilt locally (see below) because the skills live on disk. A plugin command with no on-disk equivalent has no GoMaki counterpart and does not appear in the palette.
+GoMaki works around that gap from the same files the plugin reads: it rebuilds the OpenSpec workflows from their on-disk skills (see below). A plugin command with no on-disk equivalent has no GoMaki counterpart and does not appear in the palette.
 
 `/new` is a GoMaki built-in, handled before the prompt reaches the agent.
 
 ### OpenSpec skills
 
-GoMaki also exposes the globally installed OpenSpec skills as `/opsx:<id>` commands:
+GoMaki rebuilds the commands that `opsx.lua` registers from the globally installed skills in `~/.agents/skills/`:
 
-`/opsx:explore`, `/opsx:propose`, `/opsx:apply`, `/opsx:update`, `/opsx:sync`, `/opsx:archive`, `/opsx:new`, `/opsx:continue`, `/opsx:ff`, `/opsx:verify`, `/opsx:bulk-archive`, `/opsx:onboard`
+- `/opsx` is the router. It sends a short prompt asking the agent to load the `openspec` skill and route the request; type what you want after the command.
+- `/opsx:<id>` runs one workflow: `explore`, `propose`, `new`, `continue`, `ff`, `update`, `apply`, `verify`, `sync`, `archive`, `bulk-archive`, `onboard`.
 
-Discovery reads `~/.agents/skills/<skill>/SKILL.md`, the same global location Maki's `opsx.lua` uses. A command exists only when its file is on disk, so a machine without OpenSpec installed shows none. The command sends the skill body as the prompt; arguments are appended when the body has no `$ARGUMENTS` placeholder. Run `openspec init` in the project once so the workflows have an `openspec/` root to write into.
+Discovery reads `~/.agents/skills/<skill>/SKILL.md`, the same global location the plugin uses. A command exists only while its file is on disk, so a machine without OpenSpec installed shows none. New `openspec-*` skills without a known alias get an ID from the directory name. The workflow commands send the skill body as the prompt; `$ARGUMENTS` is replaced where present, otherwise typed arguments are appended. Run `openspec init` in the project once so the workflows have an `openspec/` root to write into.
 
 After a plan-mode turn writes its plan, a **Create change from plan** action appears above the composer when the fast-forward skill is installed. It switches the session to build mode and hands the plan file to `/opsx:ff`, so the change and its artifacts are generated in one pass.
 
 ## Limitations
 
-- ACP is the boundary. Anything Maki's TUI does without sending a prompt is not available here. That includes its built-in slash commands and every command a Lua plugin registers; [What Maki sends over ACP](#what-maki-sends-over-acp) lists which commands do cross.
+- ACP is the boundary. Anything Maki's TUI does without sending a prompt is not available here. That includes its built-in slash commands and most commands a Lua plugin registers; GoMaki rebuilds the OpenSpec ones from their on-disk skills, and [What Maki sends over ACP](#what-maki-sends-over-acp) lists which commands do cross.
 - Background jobs and delegated agents are only visible as far as Maki reports them over ACP. A subagent arrives as a tool call; a background job that outlives its tool call may only show up again when its result lands in the conversation. The running-tasks window lists tool calls still marked in progress.
 - The session list follows the current working folder. It starts as the folder you launched from; File > Open Directory changes it.
 - A session that is already open in another Maki process cannot be loaded. GoMaki shows the error instead of closing silently.
@@ -165,7 +162,7 @@ After a plan-mode turn writes its plan, a **Create change from plan** action app
 
 ## How the code is arranged
 
-- `cmd/gomaki/` holds the app: view, state, settings, themes, menu, and command discovery.
+- `cmd/gomaki/` holds the app: view, state, settings, themes, menu, HTTP Mode, and the OpenSpec command list.
 - `internal/acpclient/` starts Maki, speaks ACP, and turns session updates into events for the UI.
 
 The UI does not run the agent. It sends prompts and renders what ACP gives back.

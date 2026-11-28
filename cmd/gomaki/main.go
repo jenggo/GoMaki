@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bufio"
 	_ "embed"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+	"golang.org/x/term"
 )
 
 const (
@@ -46,6 +50,9 @@ func main() {
 	a.listen = listen
 	a.port = port
 	a.cwd, _ = os.Getwd()
+	if a.password != "" && !runHeadless(a) {
+		return
+	}
 	mygo.App.OnBeforeQuit(func(e *mygo.QuitEvent) {
 		if a.busy && !a.quitting {
 			e.PreventDefault()
@@ -82,6 +89,69 @@ func main() {
 	})
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// runHeadless serves HTTP without a desktop window and reports whether to
+// continue into Desktop Mode.
+func runHeadless(a *app) bool {
+	if err := a.serveHTTP(); err != nil {
+		log.Fatal(err)
+	}
+	desktop := waitForDesktopKey()
+	a.shutdownHeadless()
+	if desktop {
+		// Desktop Mode runs its own server on demand; it must not try to
+		// rebind the port this headless server just released.
+		a.password = ""
+	}
+	return desktop
+}
+
+// waitForDesktopKey blocks until the user presses D (case-sensitive) to
+// switch to the desktop app, or until the process is interrupted.
+func waitForDesktopKey() bool {
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		if state, err := term.MakeRaw(fd); err == nil {
+			defer func() { _ = term.Restore(fd, state) }()
+		}
+	}
+	keys := make(chan bool, 1)
+	go func() { keys <- readDesktopKey(fd) }()
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
+	select {
+	case desktop := <-keys:
+		return desktop
+	case <-stop:
+		return false
+	}
+}
+
+func readDesktopKey(fd int) bool {
+	if !term.IsTerminal(fd) {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			if scanner.Text() == "D" {
+				return true
+			}
+		}
+		return false
+	}
+	buf := make([]byte, 1)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil || n == 0 {
+			return false
+		}
+		switch buf[0] {
+		case 'D':
+			return true
+		case 3: // Raw mode turns Ctrl+C into a byte instead of a signal.
+			return false
+		}
 	}
 }
 
